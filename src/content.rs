@@ -10,7 +10,8 @@
 //! The index is kept in sync by diffing, exactly like the name index: for a
 //! directory (or subtree), compare the eligible files the live name index
 //! knows about with the docs we hold, reindex what changed, tombstone what
-//! went away. The first build is just a sync of $HOME.
+//! went away. The first build is just a sync of your folders (`roots`:
+//! home, plus any configured).
 
 use crate::index::{HDR, as_bytes, fields, header, layout, sec};
 use crate::live::{Live, join};
@@ -42,12 +43,14 @@ const SKIP_DIRS: &[&[u8]] = &[
     b".nvm", b"vendor", b".pnpm-store", b"coverage", b".Trash", b".svn", b".hg", b".gradle", b".m2", b".pyenv",
     b".rbenv", b".gem", b".conda", b"miniconda3", b"anaconda3", b".docker", b".orbstack", b".colima", b".lima",
     b".ollama", b".android", b".expo", b".terraform.d", b".wrangler", b".vscode-server", b"cache", b"Cache", b"caches",
-    b"Caches",
+    b"Caches", b"AppData", b"$Recycle.Bin", b".vs", b"obj", b".nuget", b".dotnet", b"TestResults", b"scoop",
+    b"OneDriveTemp",
 ];
 
-/// Home-relative trees that are dependencies or app data, not your files.
+/// Trees under one of your folders that are dependencies or app data, not
+/// your files.
 #[rustfmt::skip]
-const SKIP_UNDER_HOME: &[&[u8]] = &[
+const SKIP_UNDER_ROOT: &[&[u8]] = &[
     b"go/pkg", b".cursor/extensions", b".vscode/extensions", b".local/share", b".local/state", b".config/gcloud", b".codex/.tmp",
 ];
 
@@ -69,6 +72,8 @@ const TEXT_EXTS: &[&[u8]] = &[
     b"gradle", b"cmake", b"mk", b"make", b"dockerfile", b"log", b"jsonl", b"ndjson", b"diff", b"patch", b"srt", b"vtt", b"rtf",
     b"svg", b"pl", b"pm", b"ps1", b"bat", b"vim", b"el", b"lisp", b"scm", b"rkt", b"elm", b"purs", b"sol", b"v", b"sv", b"vhd",
     b"asm", b"s", b"d", b"cr", b"pas", b"f90", b"cmd", b"service", b"desktop", b"gitignore", b"editorconfig", b"lock", b"sum",
+    b"csx", b"vb", b"fsx", b"csproj", b"fsproj", b"vbproj", b"sln", b"slnx", b"props", b"targets", b"razor", b"cshtml",
+    b"xaml", b"axaml", b"resx", b"config", b"psm1", b"psd1", b"nuspec", b"ahk", b"iss", b"reg", b"http", b"bicep",
 ];
 
 pub struct Segment {
@@ -618,9 +623,9 @@ fn write_segment(dir: &Path, id: u64, docs: &[DocMeta<'_>], mut next: impl FnMut
 }
 
 /// Should this file be in the content index?
-pub fn eligible(path: &[u8], size: u64, home: &[u8]) -> bool {
+pub fn eligible(path: &[u8], size: u64, roots: &[Vec<u8>]) -> bool {
     let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1)..];
-    name_ok(name, size) && in_scope(path, home)
+    name_ok(name, size) && in_scope(path, roots)
 }
 
 /// The name/size half of eligibility, checkable before building a path.
@@ -637,17 +642,25 @@ fn name_ok(name: &[u8], size: u64) -> bool {
     }
 }
 
-/// Is this path (file or directory) inside the indexed area?
-pub fn in_scope(path: &[u8], home: &[u8]) -> bool {
-    let Some(rest) = path.strip_prefix(home) else { return false };
-    if !rest.is_empty() && rest[0] != b'/' {
-        return false;
-    }
-    let rel = rest.strip_prefix(b"/").unwrap_or(rest);
-    if SKIP_UNDER_HOME.iter().any(|p| rel.starts_with(p) && rel.get(p.len()).is_none_or(|&b| b == b'/')) {
-        return false;
-    }
-    !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
+/// Is this path (file or directory) inside the indexed area: in one of
+/// your folders, outside the generated, vendored and app-data trees there?
+pub fn in_scope(path: &[u8], roots: &[Vec<u8>]) -> bool {
+    roots.iter().any(|root| {
+        let Some(rest) = path.strip_prefix(root.as_slice()) else { return false };
+        if !rest.is_empty() && rest[0] != b'/' {
+            return false;
+        }
+        let rel = rest.strip_prefix(b"/").unwrap_or(rest);
+        if SKIP_UNDER_ROOT.iter().any(|p| rel.starts_with(p) && rel.get(p.len()).is_none_or(|&b| b == b'/')) {
+            return false;
+        }
+        !rel.split(|&b| b == b'/').any(|c| SKIP_DIRS.contains(&c) || SKIP_SUFFIXES.iter().any(|x| c.len() > x.len() && c.ends_with(x)))
+    })
+}
+
+/// Is `path` a folder that one of your folders is inside of?
+pub fn holds_root(path: &[u8], roots: &[Vec<u8>]) -> bool {
+    roots.iter().any(|r| r.starts_with(path) && (path == b"/" || r.get(path.len()).is_none_or(|&b| b == b'/')))
 }
 
 /// Candidate order tier: your files first, then dot-dirs, logs and transcripts.
@@ -746,15 +759,16 @@ impl Content {
     }
 
     /// Folders holding an indexed file that changed (or went away) since
-    /// `since`: an edit in place leaves its folder's mtime alone, so lost
-    /// FSEvents history is recovered for the content index by an lstat per
+    /// `since`: an edit in place leaves its folder's mtime alone, so changes
+    /// nobody watched are found for the content index by an lstat per
     /// indexed file.
-    pub fn changed_dirs(&self, since: u32) -> Vec<Vec<u8>> {
+    /// Only files `keep` accepts are checked.
+    pub fn changed_dirs(&self, since: u32, keep: &(dyn Fn(&[u8]) -> bool + Sync)) -> Vec<Vec<u8>> {
         let pool = crate::live::stat_pool();
         let mut out: Vec<Vec<u8>> = pool.install(|| {
             self.segs
                 .par_iter()
-                .flat_map_iter(|s| (0..s.ndocs as u32).filter(|&d| !s.is_dead(d)).map(move |d| (s, d)))
+                .flat_map_iter(|s| (0..s.ndocs as u32).filter(|&d| !s.is_dead(d) && keep(s.path(d))).map(move |d| (s, d)))
                 .filter(|&(s, d)| crate::live::lstat(s.path(d)).is_none_or(|o| o.mtime >= since || o.size != s.size()[d as usize]))
                 .map(|(s, d)| {
                     let p = s.path(d);
@@ -847,9 +861,9 @@ impl Content {
 
 /// What the name index says should be indexed under `dir` (direct
 /// children only unless `recursive`).
-pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
+pub fn wanted(live: &Live, roots: &[Vec<u8>], dir: &[u8], recursive: bool) -> Docs {
     let mut want = Docs::default();
-    if !in_scope(dir, home) {
+    if !in_scope(dir, roots) {
         return want;
     }
     let idx = &live.base;
@@ -865,14 +879,14 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
             } else {
                 p = join(dir, idx.name(i));
             }
-            if in_scope(&p, home) {
+            if in_scope(&p, roots) {
                 want.push(&p, idx.size_of(i), idx.mtime()[i]);
             }
         }
     }
     let lo = join(dir, b"");
     for (k, o) in live.over.range(lo.clone()..).take_while(|(k, _)| k.starts_with(&lo)) {
-        if o.kind & 3 == KIND_FILE && (recursive || !k[lo.len()..].contains(&b'/')) && eligible(k, o.size, home) {
+        if o.kind & 3 == KIND_FILE && (recursive || !k[lo.len()..].contains(&b'/')) && eligible(k, o.size, roots) {
             want.push(k, o.size, o.mtime);
         }
     }
@@ -881,21 +895,22 @@ pub fn wanted(live: &Live, home: &[u8], dir: &[u8], recursive: bool) -> Docs {
 
 /// The dirs/trees from one batch of changes, each with what should be
 /// indexed there. Done under the name-index read lock only.
-pub fn wants(live: &Live, home: &[u8], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> Vec<(Vec<u8>, bool, Docs)> {
+pub fn wants(live: &Live, roots: &[Vec<u8>], dirs: &[Vec<u8>], trees: &[Vec<u8>]) -> Vec<(Vec<u8>, bool, Docs)> {
     let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
     for (d, r) in dirs.iter().map(|d| (d, false)).chain(trees.iter().map(|d| (d, true))) {
-        if in_scope(d, home) {
+        if in_scope(d, roots) {
             out.push((d.clone(), r));
-        } else if r && home.starts_with(d) {
-            // A subtree containing home (e.g. "/" rescanned): sync all of home.
-            out.push((home.to_vec(), true));
+        } else if r {
+            // A subtree holding some of your folders (e.g. "/" rescanned):
+            // sync those whole.
+            out.extend(roots.iter().filter(|root| holds_root(d, std::slice::from_ref(root))).map(|root| (root.clone(), true)));
         }
     }
     out.sort();
     out.dedup();
     out.into_iter()
         .map(|(d, r)| {
-            let mut w = wanted(live, home, &d, r);
+            let mut w = wanted(live, roots, &d, r);
             w.sort();
             (d, r, w)
         })
@@ -925,6 +940,8 @@ impl Grep {
         let re = RegexBuilder::new(&src)
             .case_insensitive(smart_ci && mode != GrepMode::Symbol)
             .multi_line(true)
+            // `$` before "\r\n" too: plenty of Windows text ends lines so.
+            .crlf(true)
             .size_limit(1 << 26)
             .build()
             .map_err(|e| e.to_string())?;
@@ -951,21 +968,17 @@ pub struct GrepResult {
     pub complete: bool,
 }
 
-/// File opens on this Mac stop scaling past ~4 threads (Endpoint Security
-/// clients tax every open; measured 5k files: 34 ms at 4 threads, 81 ms at
-/// 16), so candidate reads get their own small pool.
+/// Candidate reads get their own small pool: file opens stop scaling past a
+/// few threads (antivirus filters tax every open), and the search pool
+/// stays free meanwhile.
 fn read_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .thread_name(|i| format!("fsearch-read-{i}"))
-            .start_handler(|_| {
-                // Someone is waiting on these reads: keep them off the slow
-                // cores and out of the throttled IO tiers.
-                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0) };
-                crate::no_materialize()
-            })
+            // Someone is waiting on these reads.
+            .start_handler(|_| crate::sys::interactive_thread())
             .build()
             .unwrap()
     })
@@ -1231,13 +1244,20 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
     files.into_iter().map(|(p, _)| p).collect()
 }
 
-/// Open a path for reading only if it is a regular file, never blocking:
-/// O_NONBLOCK keeps a FIFO from hanging open(), and the read threads'
-/// "don't materialize dataless files" policy keeps iCloud placeholders from
-/// being downloaded just because we searched.
+/// Open a path for reading only if it is a regular file whose data is on
+/// this disk. A cloud placeholder (OneDrive's "online-only" files) is
+/// skipped rather than downloaded just because we searched: no-recall on
+/// the open, then the attributes say whether the data is here. (Links never
+/// get here: only entries of file kind are indexed or scanned.) The path is
+/// verbatim, so `name.` and `name ` open themselves, not `name`.
 pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(std::ffi::OsStr::from_bytes(path)).ok()?;
-    f.metadata().ok()?.is_file().then_some(f)
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let w = crate::paths::to_wide(path);
+    let f =
+        std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_NO_RECALL).open(std::ffi::OsString::from_wide(&w[..w.len() - 1])).ok()?;
+    let m = f.metadata().ok()?;
+    let remote = FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+    (m.is_file() && m.file_attributes() & remote == 0).then_some(f)
 }

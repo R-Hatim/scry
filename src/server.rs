@@ -1,44 +1,133 @@
-//! The daemon: one `Engine`, answering JSON lines over a unix socket.
-//! `fsearch stdio` and the CLI are thin clients.
+//! The daemon: one `Engine`, answering JSON lines over a named pipe.
+//! `fsearch stdio` and the CLI are thin clients; so can any app be.
 
-use fsearch::walk::{KIND_DIR, KIND_FILE, KIND_LINK};
-use fsearch::{Engine, GrepMode, Options, Query};
+use crate::engine::log;
+use crate::walk::{KIND_DIR, KIND_FILE, KIND_LINK};
+use crate::{Engine, GrepMode, Options, Query, paths, sys};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub fn socket_path(dir: &Path) -> PathBuf {
-    dir.join("fsearch.sock")
+/// The daemon's pipe for an index dir: one per user and index.
+pub fn pipe_name(dir: &Path) -> String {
+    let h = dir.to_string_lossy().to_lowercase().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    format!(r"\\.\pipe\fsearch-{h:016x}")
+}
+
+/// `config.json` in the index dir, all optional:
+/// `{"roots": ["~", "C:\\dev"], "skip": ["D:\\Backups"]}`.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+pub struct Config {
+    /// Your folders (see `Options::roots`); `~` is home.
+    pub roots: Vec<String>,
+    /// Folders never to open.
+    pub skip: Vec<String>,
+}
+
+/// Text as Windows editors save it: UTF-8, with or without a BOM, or
+/// UTF-16 with one (PowerShell 5's `>`).
+fn decode(b: &[u8]) -> Option<String> {
+    let utf16 = |b: &[u8], f: fn([u8; 2]) -> u16| String::from_utf16(&b.as_chunks::<2>().0.iter().map(|&c| f(c)).collect::<Vec<_>>()).ok();
+    match b {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8(rest.to_vec()).ok(),
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        _ => String::from_utf8(b.to_vec()).ok(),
+    }
+}
+
+/// Engine options for an index dir, from its `config.json`.
+pub fn options(dir: &Path, home: &str) -> Options {
+    let parsed = match std::fs::read(dir.join("config.json")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(e) => Err(e.to_string()),
+        Ok(b) => decode(&b).ok_or_else(|| "not UTF-8 or UTF-16 text".to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())),
+    };
+    let cfg = parsed.unwrap_or_else(|e| {
+        log(format!("config.json ignored: {e}"));
+        Config::default()
+    });
+    let real = |s: &String| {
+        let p = paths::from_user(s, home).map(|p| paths::to_native(&p));
+        if p.is_none() {
+            log(format!("config.json: {s} is not a folder on a drive, ignored"));
+        }
+        p
+    };
+    Options {
+        dir: dir.to_path_buf(),
+        home: home.to_string(),
+        roots: cfg.roots.iter().filter_map(real).collect(),
+        skip: cfg.skip.iter().filter_map(real).collect(),
+    }
+}
+
+/// Start `daemon` (the windowless `fsearchd.exe`) at login, or stop doing
+/// so (None).
+pub fn login_item(daemon: Option<&Path>) -> bool {
+    sys::login_item("fsearch", daemon.map(|d| format!("\"{}\"", d.display())).as_deref())
+}
+
+/// Log (stderr) to `f` from now on: a process without a console has none.
+pub fn log_to(f: std::fs::File) {
+    sys::set_stderr(f);
+}
+
+/// The daemon's log, set aside once it passes 8 MB.
+pub fn open_log(dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("daemon.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 8 << 20) {
+        let _ = std::fs::rename(&path, dir.join("daemon.log.old"));
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(path)
 }
 
 pub fn serve(dir: PathBuf, home: String) {
-    // One daemon per socket. (The engine's own lock decides who writes the
+    // One daemon per index. (The engine's own lock decides who writes the
     // index: an app embedding fsearch may own it while the daemon follows.)
     std::fs::create_dir_all(&dir).ok();
-    let Ok(lock) = std::fs::File::create(dir.join("socket.lock")) else { return };
-    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        eprintln!("{} another fsearch daemon is running", fsearch::query::now_secs());
+    let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(dir.join("socket.lock"));
+    if !lock.as_ref().is_ok_and(|l| l.try_lock().is_ok()) {
+        log("another fsearch daemon is running");
         return;
     }
-    let engine = match Engine::start(Options { dir: dir.clone(), home, skip: None }) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("{} {e}", fsearch::query::now_secs());
-            return;
-        }
+    let name = pipe_name(&dir);
+    let mut next = match sys::pipe_listen(&name, true) {
+        Ok(h) => Some(h),
+        Err(e) => return log(format!("cannot listen on {name}: {e}")),
     };
-    let sock = socket_path(&dir);
-    let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock).expect("bind socket");
-    for conn in listener.incoming().flatten() {
-        let e = engine.clone();
-        std::thread::spawn(move || handle(conn, &e));
+    let engine = match Engine::start(options(&dir, &home)) {
+        Ok(e) => e,
+        Err(e) => return log(e),
+    };
+    loop {
+        let h = match next.take().map_or_else(|| sys::pipe_listen(&name, false), Ok) {
+            Ok(h) => h,
+            Err(e) => {
+                log(format!("cannot listen on {name}: {e}"));
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+        let conn = sys::pipe_accept(h);
+        // Listening again before this one is handled: a client never finds
+        // the pipe without a free instance.
+        next = sys::pipe_listen(&name, false).ok();
+        match conn {
+            Ok(conn) => {
+                let e = engine.clone();
+                std::thread::spawn(move || handle(conn, &e));
+            }
+            // A client that hung up at once; anything else, don't spin.
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
     }
 }
 
-fn handle(conn: UnixStream, engine: &Engine) {
+fn handle(conn: std::fs::File, engine: &Engine) {
     let Ok(r) = conn.try_clone() else { return };
     let mut w = std::io::BufWriter::new(conn);
     for line in BufReader::new(r).lines() {
@@ -49,6 +138,10 @@ fn handle(conn: UnixStream, engine: &Engine) {
         let resp = respond(&line, engine);
         if writeln!(w, "{resp}").and_then(|_| w.flush()).is_err() {
             return;
+        }
+        if resp["quitting"] == true {
+            log("asked to quit");
+            std::process::exit(0);
         }
     }
 }
@@ -78,11 +171,15 @@ fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
             engine.save();
             Ok(json!({"ok": true, "scheduled": true}))
         }
+        // The process exits once this answer is written (`fsearch install`
+        // replacing the binary, say). The index is crash-safe: every file is
+        // written aside and renamed into place.
+        "quit" => Ok(json!({"ok": true, "quitting": true})),
         _ if is_grep => grep(v, engine),
         "status" => {
             let s = engine.status();
             if !s.ready {
-                return Err("indexing (first run scans the whole disk, ~20s)".into());
+                return Err("indexing (the first run lists every fixed drive, about a minute)".into());
             }
             let mut v = serde_json::to_value(s).map_err(|e| e.to_string())?;
             v["ok"] = true.into();
@@ -124,7 +221,7 @@ fn grep(v: &Value, engine: &Engine) -> Result<Value, String> {
         None => q.grep_mode,
     };
     let pattern = v.get("pattern").and_then(Value::as_str).map(str::to_string).or(q.grep.take()).ok_or("grep needs a pattern")?;
-    let mut g = fsearch::Grep::new(&pattern, mode)?;
+    let mut g = crate::Grep::new(&pattern, mode)?;
     if let Some(n) = v.get("per_file").and_then(Value::as_u64) {
         g.max_per_file = n as usize;
     }
@@ -138,7 +235,7 @@ fn grep(v: &Value, engine: &Engine) -> Result<Value, String> {
         .iter()
         .map(|f| {
             json!({
-                "path": String::from_utf8_lossy(&f.path),
+                "path": paths::display(&f.path),
                 "matches": f.lines.iter().map(|(n, t)| json!({"line": n, "text": t})).collect::<Vec<_>>(),
             })
         })
@@ -184,28 +281,50 @@ fn kind_name(k: u8) -> &'static str {
     }
 }
 
+/// Connect to the daemon if it is running.
+pub fn connect_running(dir: &Path) -> std::io::Result<std::fs::File> {
+    sys::pipe_connect(&pipe_name(dir))
+}
+
 /// Connect to the daemon, starting it if it isn't running.
-pub fn connect(dir: &Path) -> std::io::Result<UnixStream> {
-    let sock = socket_path(dir);
-    if let Ok(s) = UnixStream::connect(&sock) {
-        return Ok(s);
+pub fn connect(dir: &Path) -> std::io::Result<std::fs::File> {
+    let name = pipe_name(dir);
+    match sys::pipe_connect(&name) {
+        Ok(s) => return Ok(s),
+        // It runs, but not for us: starting another would get nowhere.
+        Err(e) if e.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32) => {
+            return Err(std::io::Error::new(e.kind(), "the daemon refuses this process (is it running as another user, or elevated?)"));
+        }
+        Err(_) => {}
     }
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("daemon.log"))?;
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    // Own session: closing the terminal that started it doesn't kill it.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    cmd.arg("serve").stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
+    start_daemon(dir, &std::env::current_exe()?)?;
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(30));
-        if let Ok(s) = UnixStream::connect(&sock) {
+        if let Ok(s) = sys::pipe_connect(&name) {
             return Ok(s);
         }
     }
-    UnixStream::connect(&sock)
+    sys::pipe_connect(&name)
+}
+
+/// Start the daemon in the background: the windowless `fsearchd.exe` next
+/// to `exe` if there is one, else `exe serve`. Detached: no console, its
+/// own process group and, where allowed, out of this terminal's job, so
+/// closing the terminal doesn't take it down.
+pub fn start_daemon(dir: &Path, exe: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
+    let daemon = exe.with_file_name("fsearchd.exe");
+    let mut cmd = std::process::Command::new(if daemon.is_file() { &daemon } else { exe });
+    if !daemon.is_file() {
+        cmd.arg("serve");
+    }
+    let log = open_log(dir)?;
+    cmd.stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    // Not the caller's folder: a long-lived process there would keep it
+    // from being renamed or deleted.
+    cmd.current_dir(dir);
+    sys::keep_std_handles();
+    let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB).spawn().or_else(|_| cmd.creation_flags(flags).spawn()).map(drop)
 }

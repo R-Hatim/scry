@@ -1,10 +1,10 @@
 //! The index as it is right now: the immutable base, a bitset of base
 //! entries that are gone, and a small overlay of entries added since.
 //!
-//! Every FSEvents directory event is handled the same way: list that one
-//! directory and diff it against what we have. The diff is idempotent, so
-//! replaying history, duplicate events, and events that race a compaction
-//! are all harmless.
+//! Every change notification names a folder and is handled the same way:
+//! list that one folder and diff it against what we have. The diff is
+//! idempotent, so catch-up relists, duplicate events, and events that race
+//! a compaction are all harmless.
 
 use crate::index::{Index, enc_size};
 use crate::walk::{self, FLAG_MOUNT, KIND_DIR, Listing, NONE, RawEnt};
@@ -35,7 +35,7 @@ pub struct Live {
     dead: Vec<u64>,
     pub dead_count: usize,
     pub over: BTreeMap<Vec<u8>, OEnt>,
-    /// Last FSEvents id fully applied.
+    /// Last event id fully applied.
     pub event_id: u64,
     /// Paths of directories added or removed since last drained; the
     /// content index re-syncs these whole subtrees.
@@ -57,6 +57,10 @@ pub struct Fetched {
     listing: Option<Listing>,
     scans: HashMap<Vec<u8>, Vec<Listing>>,
 }
+
+/// What makes an entry a different thing: its kind, and for a folder
+/// whether we descend into it (a real folder) or not (a junction).
+const SHAPE: u8 = 3 | FLAG_MOUNT;
 
 pub enum Applied {
     Done,
@@ -188,9 +192,10 @@ impl Live {
                 continue;
             }
             let name = &listing.names[r.name_off as usize..][..r.name_len as usize];
+            // A junction turned back into a real folder is new too.
             let was_dir = match cur.get(name) {
-                Some(Some(c)) => self.base.kind()[*c as usize] & 3 == KIND_DIR,
-                Some(None) => self.over.get(&join(&f.path, name)).is_some_and(|o| o.kind & 3 == KIND_DIR),
+                Some(Some(c)) => self.base.kind()[*c as usize] & SHAPE == KIND_DIR,
+                Some(None) => self.over.get(&join(&f.path, name)).is_some_and(|o| o.kind & SHAPE == KIND_DIR),
                 None => false,
             };
             if !was_dir {
@@ -260,8 +265,10 @@ impl Live {
                 Some(Some(c)) => {
                     let c = c as usize;
                     let was_kind = self.base.kind()[c];
-                    if was_kind & 3 != now.kind & 3 {
+                    if was_kind & SHAPE != now.kind & SHAPE {
                         self.kill_subtree(c as u32);
+                        // Entries added under it since the base was built.
+                        self.drop_over_subtree(&child);
                         let scan = f.scans.remove(&child);
                         self.add_new(child, now, scan);
                     } else if now.kind & 3 != KIND_DIR && (self.base.size_raw()[c] != enc_size(now.size) || self.base.mtime()[c] != now.mtime) {
@@ -271,7 +278,7 @@ impl Live {
                 }
                 Some(None) => {
                     let old = self.over[&child];
-                    if old.kind & 3 != now.kind & 3 {
+                    if old.kind & SHAPE != now.kind & SHAPE {
                         self.drop_over_subtree(&child);
                         let scan = f.scans.remove(&child);
                         self.add_new(child, now, scan);
@@ -286,6 +293,9 @@ impl Live {
             match c {
                 Some(c) => {
                     if self.base.kind()[c as usize] & 3 == KIND_DIR {
+                        // Entries added under it since the base was built
+                        // go with it.
+                        self.drop_over_subtree(&child);
                         self.trees.push(child);
                     }
                     self.kill_subtree(c)
@@ -320,13 +330,15 @@ impl Live {
     /// Folders whose listing may have changed since `since` (a wall-clock
     /// second): adding, removing or renaming an entry bumps its folder's
     /// mtime. One lstat per folder, in parallel, under a read lock;
-    /// relisting the few that changed is `apply_dir`'s job. This is how lost
-    /// FSEvents history is recovered without crawling the whole disk.
-    pub fn changed_dirs(&self, since: u32) -> Vec<Vec<u8>> {
+    /// relisting the few that changed is `apply_dir`'s job. This is how
+    /// changes made while nobody watched (or lost to an overflow) are found
+    /// without crawling the whole disk.
+    /// Only folders `keep` accepts are checked.
+    pub fn changed_dirs(&self, since: u32, keep: &(dyn Fn(&[u8]) -> bool + Sync)) -> Vec<Vec<u8>> {
         use rayon::prelude::*;
         let idx = &self.base;
         let de = idx.dir_entry();
-        let check = |p: &[u8]| !walk::blocked(p) && lstat(p).is_some_and(|o| o.mtime >= since);
+        let check = |p: &[u8]| keep(p) && !walk::blocked(p) && lstat(p).is_some_and(|o| o.mtime >= since);
         let pool = stat_pool();
         let mut out: Vec<Vec<u8>> = pool.install(|| {
             (1..idx.d)
@@ -401,7 +413,7 @@ impl Live {
 
 /// Threads for bulk lstat: path lookups scale further than opens do.
 pub fn stat_pool() -> rayon::ThreadPool {
-    rayon::ThreadPoolBuilder::new().num_threads(12).start_handler(|_| crate::no_materialize()).build().unwrap()
+    rayon::ThreadPoolBuilder::new().num_threads(12).build().unwrap()
 }
 
 /// Visit every entry of a scan with its full path.
@@ -449,17 +461,11 @@ fn subtree_bounds(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (lo, hi)
 }
 
+/// What a path is now, not following it. The virtual root "/" is a folder.
 pub fn lstat(path: &[u8]) -> Option<OEnt> {
-    let c = std::ffi::CString::new(path).ok()?;
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::lstat(c.as_ptr(), &mut st) } != 0 {
-        return None;
+    if path == b"/" {
+        return Some(OEnt::new(path, KIND_DIR, 0, 0));
     }
-    let kind = match st.st_mode & libc::S_IFMT {
-        libc::S_IFREG => walk::KIND_FILE,
-        libc::S_IFDIR => KIND_DIR,
-        libc::S_IFLNK => walk::KIND_LINK,
-        _ => walk::KIND_OTHER,
-    };
-    Some(OEnt::new(path, kind, st.st_size as u64, st.st_mtime.clamp(0, u32::MAX as i64) as u32))
+    let s = crate::sys::stat(path)?;
+    Some(OEnt::new(path, walk::kind_of(s.attrs, s.tag), s.size, s.mtime))
 }

@@ -82,18 +82,21 @@ pub struct Hit {
 
 #[rustfmt::skip]
 const TYPES: &[(&str, &[&str])] = &[
-    ("image", &["png", "jpg", "jpeg", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "svg", "raw", "cr2", "cr3", "nef", "arw", "dng", "psd", "ico", "icns", "avif", "jxl"]),
+    ("image", &["png", "jpg", "jpeg", "jfif", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "svg", "raw", "cr2", "cr3", "nef", "arw", "dng", "psd", "ico", "avif", "jxl"]),
     ("video", &["mp4", "mov", "m4v", "mkv", "avi", "webm", "wmv", "flv", "mpg", "mpeg", "3gp", "hevc"]),
-    ("audio", &["mp3", "m4a", "aac", "wav", "flac", "aiff", "aif", "ogg", "opus", "alac", "caf", "mid", "midi", "m4r"]),
-    ("doc", &["pdf", "doc", "docx", "pages", "txt", "md", "rtf", "odt", "key", "ppt", "pptx", "numbers", "xls", "xlsx", "csv", "epub", "tex"]),
-    ("code", &["rs", "c", "h", "cc", "cpp", "hpp", "m", "mm", "swift", "go", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "java", "kt", "rb", "php", "cs", "sh", "zsh", "bash", "fish", "lua", "sql", "html", "css", "scss", "json", "yaml", "yml", "toml", "xml", "vue", "svelte", "zig", "nim", "hs", "ml", "ex", "exs", "erl", "clj", "dart", "r", "jl", "metal", "glsl", "wgsl", "proto", "graphql", "nix"]),
-    ("archive", &["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "dmg", "pkg", "iso", "zst", "lz4", "xip"]),
-    ("font", &["ttf", "otf", "woff", "woff2", "ttc", "dfont"]),
+    ("audio", &["mp3", "m4a", "aac", "wav", "flac", "aiff", "aif", "ogg", "opus", "wma", "mid", "midi"]),
+    ("doc", &["pdf", "doc", "docx", "txt", "md", "rtf", "odt", "ods", "odp", "ppt", "pptx", "xls", "xlsx", "csv", "epub", "tex", "one", "xps", "msg", "eml", "vsdx"]),
+    ("code", &["rs", "c", "h", "cc", "cpp", "hpp", "go", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "java", "kt", "rb", "php", "cs", "csx", "vb", "fs", "fsx", "sh", "bash", "ps1", "psm1", "psd1", "bat", "cmd", "lua", "sql", "html", "css", "scss", "json", "yaml", "yml", "toml", "xml", "xaml", "razor", "cshtml", "csproj", "sln", "slnx", "props", "targets", "vue", "svelte", "zig", "nim", "hs", "ml", "ex", "exs", "erl", "clj", "dart", "r", "jl", "glsl", "hlsl", "wgsl", "proto", "graphql", "nix", "swift", "m", "mm"]),
+    ("archive", &["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "iso", "zst", "lz4", "cab", "msi", "msix", "appx", "nupkg", "wim", "vhd", "vhdx"]),
+    ("font", &["ttf", "otf", "woff", "woff2", "ttc", "fon"]),
+    // What you launch: programs and the shortcuts to them.
+    ("app", &["exe", "lnk", "msc", "appref-ms"]),
 ];
 
 impl Query {
-    /// Parse the human query language. Plain words are fuzzy tokens;
-    /// `'x` exact, `^x` prefix, `x$` suffix, `!x` negate; filters are
+    /// Parse the human query language. Plain words are fuzzy tokens (a
+    /// `\` or `/` in one splits it: folder tokens); `'x` exact, `^x`
+    /// prefix, `x$` suffix, `!x` negate; filters are
     /// `ext: type: kind: in: size: mtime: re: path: limit: grep: regex: sym:`.
     pub fn parse(s: &str, home: &str) -> Result<Query, String> {
         let mut q = Query { size: (0, u64::MAX), mtime: (0, u32::MAX), limit: 50, ..Default::default() };
@@ -103,7 +106,7 @@ impl Query {
             {
                 continue;
             }
-            for piece in word.split('/').filter(|p| !p.is_empty()) {
+            for piece in word.split(['/', '\\']).filter(|p| !p.is_empty()) {
                 q.push_token(piece);
             }
         }
@@ -138,11 +141,6 @@ impl Query {
             "ext" => self.exts.extend(v.split(',').map(|e| e.trim_start_matches('.').to_ascii_lowercase().into_bytes())),
             "type" => {
                 for t in v.split(',') {
-                    if t == "app" {
-                        self.kind = Some(KIND_DIR);
-                        self.exts.push(b"app".to_vec());
-                        continue;
-                    }
                     let (_, exts) = TYPES.iter().find(|(n, _)| *n == t).ok_or(format!("unknown type {t}"))?;
                     self.exts.extend(exts.iter().map(|e| e.as_bytes().to_vec()));
                 }
@@ -156,10 +154,9 @@ impl Query {
                 })
             }
             "in" => {
-                let p = v.strip_prefix('~').map_or(v.to_string(), |r| format!("{home}{r}"));
-                // The index holds real paths: /etc is /private/etc.
-                let p = std::fs::canonicalize(&p).map_or(p, |c| c.to_string_lossy().into_owned());
-                self.scope = Some(p.trim_end_matches('/').as_bytes().to_vec());
+                // The index holds real paths, in their true case.
+                let p = crate::paths::from_user(v, home).ok_or(format!("in:{v} is not a folder on a drive"))?;
+                self.scope = Some(p);
             }
             "size" => self.size = range(v, parse_size)?,
             "mtime" | "modified" => {
@@ -242,7 +239,7 @@ impl Query {
         if !pos.is_empty() && (got == 0 || (got | inherited) != all) {
             return None;
         }
-        if self.name_re.as_ref().is_some_and(|re| !re.is_match(name)) || self.path_re.as_ref().is_some_and(|re| !re.is_match(path)) {
+        if self.name_re.as_ref().is_some_and(|re| !re.is_match(name)) || self.path_re.as_ref().is_some_and(|re| !re.is_match(regex_path(path))) {
             return None;
         }
         Some(score)
@@ -649,6 +646,11 @@ fn top_k(n: usize, k: usize, visit: impl Fn(std::ops::Range<usize>, &mut TopK) +
     keys.into_iter().map(|x| Hit { score: ((x >> 32) as i64 + i32::MIN as i64) as i32, idx: !(x as u32), over: None }).collect()
 }
 
+/// What `path:` regexes match: `C:/Users/me/x`, with the query's slashes.
+fn regex_path(p: &[u8]) -> &[u8] {
+    p.strip_prefix(b"/").unwrap_or(p)
+}
+
 fn ext_ok(name: &[u8], exts: &[Vec<u8>]) -> bool {
     let Some(dot) = name.iter().rposition(|&b| b == b'.') else { return false };
     let e = &name[dot + 1..];
@@ -957,7 +959,7 @@ impl Scan<'_> {
         }
         if let Some(re) = &q.path_re {
             idx.path(i, pbuf);
-            if !re.is_match(pbuf) {
+            if !re.is_match(regex_path(pbuf)) {
                 return None;
             }
         }
@@ -1220,7 +1222,8 @@ fn name_flags(name: &[u8]) -> u8 {
     if name.first() == Some(&b'.') {
         f |= NF_DOT;
     }
-    if name.ends_with(b".app") {
+    let ext = &name[name.len().saturating_sub(4)..];
+    if ext.eq_ignore_ascii_case(b".exe") || ext.eq_ignore_ascii_case(b".lnk") {
         f |= NF_APP;
     }
     f
@@ -1236,9 +1239,10 @@ fn rank_tweaks(flags: u8, kind: u8, mtime: u32, now: u32) -> i32 {
     if kind & FLAG_HIDDEN != 0 {
         s -= 8;
     }
-    // Apps are dirs, or symlinks into the cryptex (/Applications/Safari.app).
-    if matches!(kind & 3, KIND_DIR | KIND_LINK) && flags & NF_APP != 0 {
-        s += 25;
+    // Programs and the shortcuts that start them (the Start Menu's folder
+    // prior lifts those further).
+    if kind & 3 == KIND_FILE && flags & NF_APP != 0 {
+        s += 10;
     }
     let age = now.saturating_sub(mtime);
     s += match age {

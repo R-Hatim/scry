@@ -48,11 +48,11 @@ pub struct Index {
     pub u: usize,
     names_len: usize,
     u1: usize,
-    /// FSEvents id the index is current as of; replay starts here.
+    /// Event id (FILETIME ticks, see `watch`) the index is current as of.
     pub event_id: u64,
     /// Wall-clock second the index is known complete as of (0: unknown).
-    /// If FSEvents history from `event_id` is gone, folders changed since
-    /// then are what needs relisting.
+    /// Changes made while nobody watched (Windows keeps no history) are in
+    /// the folders modified since then, which is what gets relisted.
     pub synced_at: u32,
     off: [usize; NSEC],
     plan: std::sync::OnceLock<MemoPlan>,
@@ -192,7 +192,7 @@ impl Index {
             e = if lo < r.end && self.name(lo) == comp {
                 lo as u32
             } else {
-                // APFS is case-insensitive by default; callers may not be.
+                // NTFS is case-insensitive; callers may not match its case.
                 r.clone().find(|&c| self.name(c).eq_ignore_ascii_case(comp))? as u32
             };
         }
@@ -200,8 +200,9 @@ impl Index {
     }
 
     /// Lay listings out as blocks in DFS order and compute everything derived.
-    /// Listing id 0 is the root ("/").
-    pub fn build(mut ls: Vec<Listing>, event_id: u64, synced_at: u32, home: &[u8]) -> Index {
+    /// Listing id 0 is the root ("/"). Everything under `roots` (your
+    /// folders: home, plus any configured) ranks higher.
+    pub fn build(mut ls: Vec<Listing>, event_id: u64, synced_at: u32, roots: &[Vec<u8>]) -> Index {
         ls.par_iter_mut().for_each(|l| {
             let names = &l.names;
             l.ents.sort_unstable_by(|a, b| {
@@ -305,25 +306,28 @@ impl Index {
             let p = parent[dir_entry[k] as usize] as usize;
             end[p] = end[p].max(end[k]);
         }
-        let comps: Vec<&[u8]> = home.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect();
+        let roots: Vec<Vec<&[u8]>> = roots.iter().map(|r| r.split(|&b| b == b'/').filter(|c| !c.is_empty()).collect()).collect();
         let mut prior = vec![0i8; d];
         let mut depth = vec![0u8; d];
-        // How many leading components of `home` this dir's path matches;
-        // u8::MAX once it diverges.
-        let mut hm = vec![0u8; d];
+        // Per root: how many of its leading components this dir's path
+        // matches; u8::MAX once it diverges.
+        let mut hm = vec![vec![0u8; d]; roots.len()];
         for k in 1..d {
             let e = dir_entry[k] as usize;
             let p = parent[e] as usize;
             let nm = &names[name_off[e] as usize..][..name_len[e] as usize];
             depth[k] = depth[p].saturating_add(1);
-            hm[k] = match hm[p] {
-                u8::MAX => u8::MAX,
-                h if h as usize >= comps.len() => h,
-                h if comps[h as usize] == nm => h + 1,
-                _ => u8::MAX,
-            };
-            let entered_home = hm[k] as usize == comps.len() && (hm[p] as usize) < comps.len();
-            let adj = prior_adjust(nm, depth[k]) + if entered_home { 15 } else { 0 };
+            let mut entered = false;
+            for (comps, hm) in roots.iter().zip(&mut hm) {
+                hm[k] = match hm[p] {
+                    u8::MAX => u8::MAX,
+                    h if h as usize >= comps.len() => h,
+                    h if comps[h as usize] == nm => h + 1,
+                    _ => u8::MAX,
+                };
+                entered |= hm[k] as usize == comps.len() && (hm[p] as usize) < comps.len();
+            }
+            let adj = prior_adjust(nm, depth[k]) + if entered { 15 } else { 0 };
             prior[k] = (prior[p] as i32 + adj).clamp(-100, 60) as i8;
         }
 
@@ -519,44 +523,37 @@ pub fn char_bit(b: u8) -> u64 {
     }
 }
 
-#[rustfmt::skip]
-const BUNDLE_EXTS: &[&[u8]] = &[
-    b".framework", b".bundle", b".plugin", b".appex", b".kext", b".xpc", b".lproj", b".xcassets", b".photoslibrary",
-    b".musiclibrary", b".tvlibrary", b".imovielibrary", b".dSYM", b".xcarchive", b".sdk", b".platform",
-];
-
 /// How much a directory's name moves everything under it in ranking.
+/// Depth 1 is a drive, depth 2 a folder at a drive's root.
 fn prior_adjust(name: &[u8], depth: u8) -> i32 {
     if depth == 1 {
+        return 0;
+    }
+    if depth == 2 {
         return match name {
-            b"Users" => 0,
-            b"Applications" => 10,
-            b"Volumes" => -10,
-            b"Library" => -25,
-            b"System" => -40,
-            b"opt" => -25,
-            _ => -35,
+            b"Windows" | b"Windows.old" | b"System Volume Information" | b"Recovery" | b"Config.Msi" | b"MSOCache" => -40,
+            _ if name.first() == Some(&b'$') => -40,
+            b"ProgramData" => -25,
+            b"PerfLogs" | b"Intel" | b"AMD" | b"NVIDIA" | b"inetpub" | b"OneDriveTemp" | b"Drivers" => -30,
+            // Users, Program Files, and the folders people keep at the top
+            // of a drive (C:\dev, D:\Projects).
+            _ => 0,
         };
     }
-    if name == b"Applications" {
-        return 30;
-    }
-    if name.ends_with(b".app") {
-        return -25;
-    }
-    if BUNDLE_EXTS.iter().any(|x| name.len() > x.len() && name[name.len() - x.len()..].eq_ignore_ascii_case(x)) {
-        return -20;
+    // Shortcuts to every installed app: what "open chrome" means.
+    if name == b"Start Menu" {
+        return 45;
     }
     if name.first() == Some(&b'.') {
         return -25;
     }
     match name {
-        b"Library" => -20,
-        b"Caches" | b"caches" | b"cache" | b"Cache" | b"Logs" | b"DerivedData" | b"CoreSimulator" => -20,
+        b"AppData" => -20,
+        b"Recent" => -30,
+        b"Caches" | b"caches" | b"cache" | b"Cache" | b"INetCache" | b"Logs" | b"CrashDumps" | b"WER" => -20,
         b"node_modules" | b"__pycache__" | b"site-packages" | b"Pods" | b"venv" | b"bower_components" => -30,
-        b"target" | b"build" | b"dist" | b"out" | b"vendor" | b"deps" | b"tmp" | b"temp" => -12,
-        b"folders" | b"Containers" | b"Group Containers" => -10,
-        b"Application Support" => -5,
+        b"target" | b"build" | b"dist" | b"out" | b"vendor" | b"deps" | b"obj" | b"tmp" | b"temp" | b"Temp" => -12,
+        b"WindowsApps" | b"Packages" | b"WinSxS" | b"assembly" => -10,
         _ => 0,
     }
 }

@@ -1,100 +1,47 @@
-mod server;
+//! The `fsearch` command: searches through the daemon (starting it when
+//! needed), runs it, installs it.
 
-use fsearch::{index, live, query};
-
-use std::alloc::{GlobalAlloc, Layout, System};
+use fsearch::{index, live, query, server};
+use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-/// Big buffers (index builds, content batches) come straight from mmap and
-/// go straight back with munmap. macOS's malloc keeps freed large blocks
-/// mapped and dirty, which left the daemon at ~1 GB footprint after a build
-/// while only ~2 MB was live.
-struct Alloc;
-const BIG: usize = 1 << 20;
-
-unsafe impl GlobalAlloc for Alloc {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if l.size() < BIG || l.align() > 16384 {
-            return unsafe { System.alloc(l) };
-        }
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), l.size(), libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0) };
-        if p == libc::MAP_FAILED { std::ptr::null_mut() } else { p as *mut u8 }
-    }
-    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        // Fresh anonymous pages are already zero.
-        if l.size() < BIG || l.align() > 16384 { unsafe { System.alloc_zeroed(l) } } else { unsafe { self.alloc(l) } }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        if l.size() < BIG || l.align() > 16384 {
-            unsafe { System.dealloc(p, l) }
-        } else {
-            unsafe { libc::munmap(p as *mut libc::c_void, l.size()) };
-        }
-    }
-    unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
-        if (l.size() < BIG && new_size < BIG) || l.align() > 16384 {
-            return unsafe { System.realloc(p, l, new_size) };
-        }
-        let q = unsafe { self.alloc(Layout::from_size_align_unchecked(new_size, l.align())) };
-        if !q.is_null() {
-            unsafe {
-                std::ptr::copy_nonoverlapping(p, q, l.size().min(new_size));
-                self.dealloc(p, l);
-            }
-        }
-        q
-    }
-}
-
-#[global_allocator]
-static GLOBAL: Alloc = Alloc;
-
-const USAGE: &str = "usage:
+const USAGE: &str = r"usage:
   fsearch <query...> [--json]   search (starts the daemon if needed)
   fsearch stdio                 JSON lines on stdin/stdout
   fsearch serve                 run the daemon in the foreground
   fsearch status
-  fsearch install [--login]      copy to ~/.local/bin; --login also starts the daemon at login
-                                (needs Full Disk Access granted to ~/.local/bin/fsearch)
-  fsearch uninstall             remove the login agent (keeps the index)
+  fsearch stop                  stop the daemon (the next search starts it again)
+  fsearch install [--login]     copy to ~\.local\bin; --login also starts the daemon at login
+  fsearch uninstall             remove the login item and stop the daemon (keeps the index)
   fsearch bench <query...>      time a query in-process against the saved index";
 
-const LABEL: &str = "mt.nd.fsearch";
-
 fn home() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/".into())
+    fsearch::default_home()
 }
 
 fn data_dir() -> PathBuf {
-    let d = PathBuf::from(home()).join("Library/Application Support/FSearch");
+    let d = fsearch::default_dir(&home());
     std::fs::create_dir_all(&d).ok();
     d
 }
 
-unsafe extern "C" {
-    fn setiopolicy_np(iotype: i32, scope: i32, policy: i32) -> i32;
-}
-
 fn main() {
-    // Never let a search download iCloud placeholders: opening or listing a
-    // dataless file/dir fails fast instead of materializing it.
-    // (IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, OFF)
-    unsafe { setiopolicy_np(3, 0, 1) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
         Some("serve") => server::serve(data_dir(), home()),
         Some("stdio") => stdio(),
-        Some("status") => print_one(&serde_json::json!({"op": "status"}), true),
+        Some("status") => print_one(&json!({"op": "status"}), true),
+        Some("stop") => stop(true),
         Some("bench") => bench(&args[1..].join(" ")),
         Some("install") => install(args.iter().any(|a| a == "--login")),
         Some("uninstall") => uninstall(),
         Some(_) => {
             let json = args.iter().any(|a| a == "--json");
             let q: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
-            print_one(&serde_json::json!({"q": q.join(" ")}), json);
+            print_one(&json!({"q": q.join(" ")}), json);
         }
     }
 }
@@ -123,22 +70,25 @@ fn print_one(req: &serde_json::Value, raw: bool) {
     }
 }
 
+/// One request, one answer, in turn: a pipe handle does one read or write
+/// at a time, so a reader blocked on it would stall a writer.
 fn stdio() {
     let s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
-    let mut up = s.try_clone().unwrap();
-    std::thread::spawn(move || {
-        for line in std::io::stdin().lock().lines() {
-            let Ok(line) = line else { break };
-            if writeln!(up, "{line}").is_err() {
-                break;
-            }
-        }
-        let _ = up.shutdown(std::net::Shutdown::Write);
-    });
+    let mut r = BufReader::new(s.try_clone().unwrap());
+    let mut w = s;
     let mut out = std::io::stdout().lock();
-    for line in BufReader::new(s).lines() {
+    let mut resp = String::new();
+    for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
-        if writeln!(out, "{line}").and_then(|_| out.flush()).is_err() {
+        // The daemon answers nothing to an empty line.
+        if line.trim().is_empty() {
+            continue;
+        }
+        resp.clear();
+        if writeln!(w, "{line}").is_err() || r.read_line(&mut resp).unwrap_or(0) == 0 {
+            break;
+        }
+        if out.write_all(resp.as_bytes()).and_then(|_| out.flush()).is_err() {
             break;
         }
     }
@@ -159,74 +109,76 @@ fn bench(qs: &str) {
     let mut p = Vec::new();
     for h in hits.iter().take(10) {
         live.base.path(h.idx as usize, &mut p);
-        println!("{:5} {}", h.score, String::from_utf8_lossy(&p));
+        println!("{:5} {}", h.score, fsearch::paths::display(&p));
     }
+    let first = times[0];
     times.sort();
-    eprintln!("first {:.2?}  median {:.2?}  min {:.2?}", times[0].max(times[times.len() - 1]), times[times.len() / 2], times[0]);
+    eprintln!("first {first:.2?}  median {:.2?}  min {:.2?}", times[times.len() / 2], times[0]);
 }
 
-fn plist_path() -> PathBuf {
-    PathBuf::from(home()).join(format!("Library/LaunchAgents/{LABEL}.plist"))
-}
-
-fn launchctl(args: &[&str]) -> bool {
-    std::process::Command::new("launchctl").args(args).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
-}
-
-fn domain() -> String {
-    format!("gui/{}", unsafe { libc::getuid() })
+/// Ask the daemon to exit and wait until it has.
+fn stop(verbose: bool) {
+    let dir = data_dir();
+    let Ok(mut s) = server::connect_running(&dir) else {
+        if verbose {
+            println!("the daemon is not running");
+        }
+        return;
+    };
+    let _ = writeln!(s, "{}", json!({"op": "quit"}));
+    let _ = BufReader::new(&s).read_line(&mut String::new());
+    drop(s);
+    for _ in 0..100 {
+        if server::connect_running(&dir).is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if verbose {
+        println!("stopped the daemon");
+    }
 }
 
 fn install(login: bool) {
-    let bin = PathBuf::from(home()).join(".local/bin/fsearch");
-    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-    // Replace, never overwrite in place: a rewritten signed binary at the same
-    // path can be SIGKILLed by the code-signing cache.
-    let _ = std::fs::remove_file(&bin);
-    std::fs::copy(std::env::current_exe().unwrap(), &bin).unwrap_or_else(|e| die(&format!("copy: {e}")));
-    if !login {
+    let bin = PathBuf::from(home()).join(r".local\bin");
+    std::fs::create_dir_all(&bin).unwrap_or_else(|e| die(&format!("{}: {e}", bin.display())));
+    let exe = std::env::current_exe().unwrap();
+    // The next search starts the new daemon.
+    stop(false);
+    for name in ["fsearch.exe", "fsearchd.exe"] {
+        let (src, dst) = (exe.with_file_name(name), bin.join(name));
+        if !src.is_file() || src == dst {
+            continue;
+        }
+        // A running program can't be overwritten, but it can be renamed:
+        // set the old one aside, and remove it unless it is still running
+        // (then the next install does).
+        let old = dst.with_extension("exe.old");
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::rename(&dst, &old);
+        std::fs::copy(&src, &dst).unwrap_or_else(|e| die(&format!("copy {name}: {e}")));
+        let _ = std::fs::remove_file(&old);
+    }
+    let daemon = bin.join("fsearchd.exe");
+    if login {
+        if !daemon.is_file() || !server::login_item(Some(&daemon)) {
+            die("could not add the login item");
+        }
+        server::start_daemon(&data_dir(), &bin.join("fsearch.exe")).unwrap_or_else(|e| die(&format!("start the daemon: {e}")));
+        println!("installed {} (starts at login, running now)", bin.display());
+    } else {
         println!("installed {}; the daemon starts on first use", bin.display());
-        return;
     }
-    let log = data_dir().join("daemon.log");
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{LABEL}</string>
-  <key>ProgramArguments</key><array><string>{}</string><string>serve</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>{}</string>
-  <key>StandardErrorPath</key><string>{}</string>
-</dict>
-</plist>
-"#,
-        bin.display(),
-        log.display(),
-        log.display()
-    );
-    std::fs::write(plist_path(), plist).unwrap();
-    let target = format!("{}/{LABEL}", domain());
-    launchctl(&["bootout", &target]);
-    // bootout returns before the old job is fully gone; bootstrap fails
-    // until it is.
-    let bootstrap = || launchctl(&["bootstrap", &domain(), plist_path().to_str().unwrap()]);
-    let retry = || {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        false
-    };
-    if !(0..50).any(|_| bootstrap() || retry()) {
-        die("launchctl bootstrap failed");
+    let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == bin));
+    if !on_path {
+        println!("add {} to your PATH to run fsearch from anywhere", bin.display());
     }
-    println!("installed {} (LaunchAgent {LABEL})", bin.display());
 }
 
 fn uninstall() {
-    launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
-    let _ = std::fs::remove_file(plist_path());
-    println!("removed LaunchAgent {LABEL}; index kept in {}", data_dir().display());
+    server::login_item(None);
+    stop(false);
+    println!("removed the login item and stopped the daemon; index kept in {}", data_dir().display());
 }
 
 fn die(msg: &str) -> ! {

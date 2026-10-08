@@ -1,39 +1,59 @@
-//! Parallel whole-disk enumeration with getattrlistbulk(2).
+//! Parallel whole-disk enumeration.
 //!
-//! One syscall returns hundreds of entries with name, type, size, mtime and
-//! flags already attached, so there is no per-file stat. Directories fan out
-//! over a rayon pool; mount points are not crossed, firmlinks are (that is
-//! how /Users etc. on the data volume appear under / exactly once).
+//! Each folder is opened relative to its parent's handle (NT's openat, so
+//! no path is rebuilt or re-walked from the drive root) and read with
+//! GetFileInformationByHandleEx: one call returns hundreds of entries with
+//! name, attributes, size and mtime already attached, so there is no
+//! per-file stat. Folders fan out over a rayon pool. The root "/" is
+//! virtual: its children are the fixed drives. Reparse points that stand
+//! for another place (symlinks, junctions, volume mount points) are kept as
+//! entries but never entered, so every folder is listed once, under its real
+//! path.
 
+use crate::{paths, sys};
 use rayon::Scope;
 use std::cell::RefCell;
-use std::ffi::CString;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DEVICE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT};
+use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
 
 pub const NONE: u32 = u32::MAX;
 
-/// Folders never to open: set when the daemon runs without Full Disk
-/// Access, where opening a consent-gated folder (Downloads, Desktop, ...)
-/// pops a privacy prompt and blocks the call until someone answers it.
+/// Folders never to open (`Options::skip`).
 pub static SKIP: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 
 pub fn blocked(path: &[u8]) -> bool {
     SKIP.get().is_some_and(|v| v.iter().any(|s| path.starts_with(s) && (path.len() == s.len() || path[s.len()] == b'/')))
 }
 
-const ATTR_CMN_ERROR: u32 = 0x2000_0000;
-const DIR_MNTSTATUS_TRIGGER: u32 = 0x2;
-
 pub const KIND_FILE: u8 = 0;
 pub const KIND_DIR: u8 = 1;
 pub const KIND_LINK: u8 = 2;
 pub const KIND_OTHER: u8 = 3;
 
-/// Entry flag bit: UF_HIDDEN set by the Finder.
+/// Entry flag bit: the hidden attribute.
 pub const FLAG_HIDDEN: u8 = 1 << 2;
-/// Directory that is a mount point we did not descend into.
+/// A folder we do not descend into: a junction or a volume mount point.
 pub const FLAG_MOUNT: u8 = 1 << 3;
+
+/// An entry's kind and flags, from its attributes and reparse tag. Only
+/// reparse points that name another place count as links; the rest (cloud
+/// placeholders, dedup, app execution aliases) are what they look like.
+pub fn kind_of(attrs: u32, tag: u32) -> u8 {
+    let dir = attrs & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let k = if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 && sys::elsewhere(tag) {
+        // A folder whose tag we can't tell is kept as one, never entered.
+        if dir && matches!(tag, IO_REPARSE_TAG_MOUNT_POINT | 0) { KIND_DIR | FLAG_MOUNT } else { KIND_LINK }
+    } else if dir {
+        KIND_DIR
+    } else if attrs & FILE_ATTRIBUTE_DEVICE != 0 {
+        KIND_OTHER
+    } else {
+        KIND_FILE
+    };
+    if attrs & FILE_ATTRIBUTE_HIDDEN != 0 { k | FLAG_HIDDEN } else { k }
+}
 
 #[derive(Clone, Copy)]
 pub struct RawEnt {
@@ -59,26 +79,47 @@ struct Ctx {
 }
 
 thread_local! {
-    static BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; 256 * 1024]);
+    static BUF: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Scan `root` recursively. Listing id 0 is `root` itself.
 pub fn scan(root: &[u8], threads: usize) -> Vec<Listing> {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).start_handler(|_| crate::no_materialize()).build().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
     let ctx = Ctx { next_id: AtomicU32::new(1), out: (0..threads + 1).map(|_| Mutex::new(Vec::new())).collect() };
-    raise_fd_limit();
-    let fd = if blocked(root) { -1 } else { CString::new(root).map_or(-1, |c| unsafe { libc::open(c.as_ptr(), OPEN_DIR) }) };
     // Paths are only tracked when there is something to skip.
-    let path = SKIP.get().is_some_and(|v| !v.is_empty()).then(|| root.to_vec());
-    pool.scope(|s| finish_dir(s, fd, path, 0, &ctx));
+    let track = SKIP.get().is_some_and(|v| !v.is_empty());
+    pool.scope(|s| {
+        if root != b"/" {
+            let h = if blocked(root) { None } else { sys::open_dir(root, false) };
+            return finish_dir(s, h, track.then(|| root.to_vec()), 0, &ctx);
+        }
+        let mut l = drives();
+        let mut kids = Vec::new();
+        for e in l.ents.iter_mut() {
+            let path = crate::live::join(b"/", &l.names[e.name_off as usize..][..e.name_len as usize]);
+            if !blocked(&path) {
+                e.child = ctx.next_id.fetch_add(1, Ordering::Relaxed);
+                kids.push((path, e.child));
+            }
+        }
+        push(l, &ctx);
+        let ctx = &ctx;
+        for (path, id) in kids {
+            s.spawn(move |s| finish_dir(s, sys::open_dir(&path, false), track.then_some(path), id, ctx));
+        }
+    });
     ctx.out.into_iter().flat_map(|m| m.into_inner().unwrap()).collect()
 }
 
-fn raise_fd_limit() {
-    let mut r: libc::rlimit = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) };
-    r.rlim_cur = r.rlim_max.min(65536);
-    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+/// The virtual root's listing: a folder per fixed drive.
+fn drives() -> Listing {
+    let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
+    for d in sys::fixed_drives() {
+        let mtime = sys::stat(&[b'/', d, b':']).map_or(0, |s| s.mtime);
+        l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: 2, kind: KIND_DIR, size: 0, mtime, child: NONE });
+        l.names.extend_from_slice(&[d, b':']);
+    }
+    l
 }
 
 /// List a single directory (no recursion). Subdirectories come back with
@@ -87,32 +128,25 @@ pub fn list_one(path: &[u8]) -> Option<Listing> {
     if blocked(path) {
         return None;
     }
-    let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
-    list_into(path, &mut l).then_some(l)
-}
-
-const OPEN_DIR: i32 = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-
-/// Directory fd shared by the tasks that still need to openat() a child.
-struct Fd(i32);
-impl Drop for Fd {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.0) };
+    if path == b"/" {
+        return Some(drives());
     }
+    let h = sys::open_dir(path, false)?;
+    let mut l = Listing { id: 0, names: Vec::new(), ents: Vec::new() };
+    // Half a listing would read as half the folder deleted.
+    list_handle(&h, &mut l).then_some(l)
 }
 
-// Children are opened with openat() relative to the parent's fd, so paths
-// never get rebuilt and PATH_MAX never bites. Measured on this Mac: open() +
-// close() is ~19us per directory (two Endpoint Security clients tax every
-// open), getattrlistbulk ~14us; past ~8 threads the kernel side stops scaling.
-fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &'s Ctx) {
+// Children are opened relative to the parent's handle, which stays open
+// until the last of them is.
+fn finish_dir<'s>(s: &Scope<'s>, h: Option<sys::Handle>, path: Option<Vec<u8>>, id: u32, ctx: &'s Ctx) {
     let mut l = Listing { id, names: Vec::new(), ents: Vec::new() };
-    if fd < 0 {
+    let Some(h) = h else {
         push(l, ctx);
         return;
-    }
-    list_fd(fd, &mut l);
-    let me = std::sync::Arc::new(Fd(fd));
+    };
+    list_handle(&h, &mut l);
+    let me = Arc::new(h);
     let mut kids = Vec::new();
     for e in l.ents.iter_mut() {
         if e.kind & 3 == KIND_DIR && e.kind & FLAG_MOUNT == 0 {
@@ -122,16 +156,18 @@ fn finish_dir<'s>(s: &Scope<'s>, fd: i32, path: Option<Vec<u8>>, id: u32, ctx: &
                 continue;
             }
             e.child = ctx.next_id.fetch_add(1, Ordering::Relaxed);
-            kids.push((CString::new(name).unwrap_or_default(), e.child, child_path));
+            let mut w = Vec::with_capacity(name.len());
+            paths::push_utf16(&mut w, name);
+            kids.push((w, e.child, child_path));
         }
     }
     push(l, ctx);
     for (name, cid, child_path) in kids {
         let parent = me.clone();
         s.spawn(move |s| {
-            let fd = unsafe { libc::openat(parent.0, name.as_ptr(), OPEN_DIR) };
+            let h = sys::open_subdir(&parent, &name);
             drop(parent);
-            finish_dir(s, fd, child_path, cid, ctx);
+            finish_dir(s, h, child_path, cid, ctx);
         });
     }
 }
@@ -141,99 +177,25 @@ fn push(l: Listing, ctx: &Ctx) {
     ctx.out[slot].lock().unwrap().push(l);
 }
 
-fn rd32(b: &[u8], at: usize) -> u32 {
-    u32::from_ne_bytes(b[at..at + 4].try_into().unwrap())
-}
-
-fn rd64(b: &[u8], at: usize) -> u64 {
-    u64::from_ne_bytes(b[at..at + 8].try_into().unwrap())
-}
-
-/// Returns false if the directory could not be opened.
-fn list_into(path: &[u8], l: &mut Listing) -> bool {
-    let Ok(cpath) = CString::new(path) else { return false };
-    let fd = unsafe { libc::open(cpath.as_ptr(), OPEN_DIR) };
-    if fd < 0 {
-        return false;
-    }
-    list_fd(fd, l);
-    unsafe { libc::close(fd) };
-    true
-}
-
-fn list_fd(fd: i32, l: &mut Listing) {
-    let mut al: libc::attrlist = unsafe { std::mem::zeroed() };
-    al.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
-    al.commonattr =
-        libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_NAME | ATTR_CMN_ERROR | libc::ATTR_CMN_OBJTYPE | libc::ATTR_CMN_MODTIME | libc::ATTR_CMN_FLAGS;
-    al.dirattr = libc::ATTR_DIR_MOUNTSTATUS;
-    al.fileattr = libc::ATTR_FILE_DATALENGTH;
+/// False if the listing broke off before the end.
+fn list_handle(h: &sys::Handle, l: &mut Listing) -> bool {
     BUF.with_borrow_mut(|buf| {
-        loop {
-            let n = unsafe { libc::getattrlistbulk(fd, &mut al as *mut _ as *mut libc::c_void, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-            if n <= 0 {
-                break;
+        sys::read_dir(h, buf, |e| {
+            let off = l.names.len();
+            paths::push_wide(&mut l.names, e.name);
+            let len = l.names.len() - off;
+            if len == 0 || len > u16::MAX as usize {
+                l.names.truncate(off);
+                return;
             }
-            let mut p = 0usize;
-            for _ in 0..n {
-                let len = rd32(buf, p) as usize;
-                parse_entry(&buf[p..p + len], l);
-                p += len;
-            }
-        }
-    });
-}
-
-fn parse_entry(b: &[u8], l: &mut Listing) {
-    let common = rd32(b, 4);
-    let dirattr = rd32(b, 12);
-    let fileattr = rd32(b, 16);
-    let mut f = 24;
-    if common & ATTR_CMN_ERROR != 0 {
-        f += 4;
-    }
-    if common & libc::ATTR_CMN_NAME == 0 {
-        return;
-    }
-    let off = rd32(b, f) as i32 as isize;
-    let nlen = rd32(b, f + 4) as usize;
-    let start = (f as isize + off) as usize;
-    let name = &b[start..start + nlen.saturating_sub(1)];
-    f += 8;
-    let mut kind = KIND_OTHER;
-    if common & libc::ATTR_CMN_OBJTYPE != 0 {
-        kind = match rd32(b, f) {
-            1 => KIND_FILE,
-            2 => KIND_DIR,
-            5 => KIND_LINK,
-            _ => KIND_OTHER,
-        };
-        f += 4;
-    }
-    let mut mtime = 0u32;
-    if common & libc::ATTR_CMN_MODTIME != 0 {
-        mtime = (rd64(b, f) as i64).clamp(0, u32::MAX as i64) as u32;
-        f += 16;
-    }
-    if common & libc::ATTR_CMN_FLAGS != 0 {
-        if rd32(b, f) & libc::UF_HIDDEN != 0 {
-            kind |= FLAG_HIDDEN;
-        }
-        f += 4;
-    }
-    if dirattr & libc::ATTR_DIR_MOUNTSTATUS != 0 {
-        if rd32(b, f) & (libc::DIR_MNTSTATUS_MNTPOINT | DIR_MNTSTATUS_TRIGGER) != 0 {
-            kind |= FLAG_MOUNT;
-        }
-        f += 4;
-    }
-    let mut size = 0u64;
-    if fileattr & libc::ATTR_FILE_DATALENGTH != 0 {
-        size = rd64(b, f);
-    }
-    if name.is_empty() || name.len() > u16::MAX as usize {
-        return;
-    }
-    l.ents.push(RawEnt { name_off: l.names.len() as u32, name_len: name.len() as u16, kind, size, mtime, child: NONE });
-    l.names.extend_from_slice(name);
+            l.ents.push(RawEnt {
+                name_off: off as u32,
+                name_len: len as u16,
+                kind: kind_of(e.attrs, e.tag),
+                size: e.size,
+                mtime: e.mtime,
+                child: NONE,
+            });
+        })
+    })
 }
