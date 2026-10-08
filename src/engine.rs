@@ -110,7 +110,7 @@ struct Shared {
 
 /// One line to stderr (the daemon's log); a full disk must not take the
 /// caller down with it.
-pub(crate) fn log(msg: impl AsRef<str>) {
+pub fn log(msg: impl AsRef<str>) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "{} {}", crate::query::now_secs(), msg.as_ref());
 }

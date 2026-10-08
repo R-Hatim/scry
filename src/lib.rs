@@ -18,5 +18,5 @@ pub mod walk;
 mod watch;
 
 pub use content::{FileMatches, Grep, GrepResult};
-pub use engine::{Engine, Found, Options, Status, default_dir, default_home, elevated};
+pub use engine::{Engine, Found, Options, Status, default_dir, default_home, elevated, log};
 pub use query::{GrepMode, Query};

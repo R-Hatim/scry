@@ -16,7 +16,7 @@ pub fn pipe_name(dir: &Path) -> String {
 }
 
 /// `config.json` in the index dir, all optional:
-/// `{"roots": ["~", "C:\\dev"], "skip": ["D:\\Backups"]}`.
+/// `{"roots": ["~", "C:\\dev"], "skip": ["D:\\Backups"], "hotkey": "Alt+Shift+Space"}`.
 #[derive(serde::Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -24,6 +24,8 @@ pub struct Config {
     pub roots: Vec<String>,
     /// Folders never to open.
     pub skip: Vec<String>,
+    /// What brings up the search bar (`fsearchd`).
+    pub hotkey: Option<String>,
 }
 
 /// Text as Windows editors save it: UTF-8, with or without a BOM, or
@@ -38,17 +40,23 @@ fn decode(b: &[u8]) -> Option<String> {
     }
 }
 
-/// Engine options for an index dir, from its `config.json`.
-pub fn options(dir: &Path, home: &str) -> Options {
+/// The index dir's `config.json` (defaults if there is none, or it is
+/// unreadable: that is logged).
+pub fn config(dir: &Path) -> Config {
     let parsed = match std::fs::read(dir.join("config.json")) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e.to_string()),
         Ok(b) => decode(&b).ok_or_else(|| "not UTF-8 or UTF-16 text".to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())),
     };
-    let cfg = parsed.unwrap_or_else(|e| {
+    parsed.unwrap_or_else(|e| {
         log(format!("config.json ignored: {e}"));
         Config::default()
-    });
+    })
+}
+
+/// Engine options for an index dir, from its `config.json`.
+pub fn options(dir: &Path, home: &str) -> Options {
+    let cfg = config(dir);
     let real = |s: &String| {
         let p = paths::from_user(s, home).map(|p| paths::to_native(&p));
         if p.is_none() {
@@ -85,23 +93,36 @@ pub fn open_log(dir: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().create(true).append(true).open(path)
 }
 
-pub fn serve(dir: PathBuf, home: String) {
-    // One daemon per index. (The engine's own lock decides who writes the
-    // index: an app embedding fsearch may own it while the daemon follows.)
-    std::fs::create_dir_all(&dir).ok();
-    let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(dir.join("socket.lock"));
-    if !lock.as_ref().is_ok_and(|l| l.try_lock().is_ok()) {
+/// Become the daemon for an index dir: one per index. Holding the returned
+/// lock is being it; the lock dies with the process. None if another
+/// daemon runs. (The engine's own lock decides who writes the index: an app
+/// embedding fsearch may own it while the daemon follows.)
+pub fn claim(dir: &Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(dir).ok();
+    let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(dir.join("socket.lock")).ok()?;
+    if lock.try_lock().is_err() {
         log("another fsearch daemon is running");
-        return;
+        return None;
     }
-    let name = pipe_name(&dir);
+    Some(lock)
+}
+
+/// The daemon: claim the index dir, start an engine, answer on its pipe.
+pub fn serve(dir: PathBuf, home: String) {
+    let Some(_lock) = claim(&dir) else { return };
+    match Engine::start(options(&dir, &home)) {
+        Ok(engine) => listen(&dir, &engine),
+        Err(e) => log(e),
+    }
+}
+
+/// Answer clients on the index dir's pipe with `engine`, until the process
+/// ends. Call while holding `claim`'s lock.
+pub fn listen(dir: &Path, engine: &Engine) {
+    let name = pipe_name(dir);
     let mut next = match sys::pipe_listen(&name, true) {
         Ok(h) => Some(h),
         Err(e) => return log(format!("cannot listen on {name}: {e}")),
-    };
-    let engine = match Engine::start(options(&dir, &home)) {
-        Ok(e) => e,
-        Err(e) => return log(e),
     };
     loop {
         let h = match next.take().map_or_else(|| sys::pipe_listen(&name, false), Ok) {

@@ -10,10 +10,24 @@ which is macOS-only.
 
 ```
 cargo build --release
-target\release\fsearch install          # -> %USERPROFILE%\.local\bin
+target\release\fsearch install --login  # -> %USERPROFILE%\.local\bin, started at login
 fsearch fsearch main                    # find files by name
 fsearch "ext:rs grep:apply_dir"         # search inside files
 ```
+
+## Search bar
+
+**Alt+Shift+Space** brings up a search box in the middle of the screen.
+Results come as you type; Up/Down picks one, **Enter** opens it,
+**Ctrl+Enter** shows it in Explorer, **Esc** (or a click elsewhere) puts
+the bar away. The whole query language works in it (`ext:pdf invoice`,
+`grep:TODO in:C:\Workspace`).
+
+The bar lives in the daemon, `fsearchd.exe`: it is there whenever the
+daemon runs (at login with `install --login`, or from the first search).
+Another key: `"hotkey": "Win+Shift+F"` in `config.json`. Without one, the
+first free of Alt+Shift+Space, Win+Shift+F and Ctrl+Alt+F is used;
+`daemon.log` says which.
 
 ## Speed
 
@@ -53,7 +67,7 @@ ranks first. By default that is your user folder; add your own in
 restarts the daemon):
 
 ```json
-{"roots": ["~", "C:\\Workspace"], "skip": ["D:\\Backups"]}
+{"roots": ["~", "C:\\Workspace"], "skip": ["D:\\Backups"], "hotkey": "Alt+Shift+Space"}
 ```
 
 `skip` lists folders never to open. Folders outside your roots are still
@@ -65,8 +79,8 @@ are online-only are never downloaded by a search.
 ## Login item and elevation
 
 `fsearch install --login` also starts the daemon at login (a `Run` entry
-for `fsearchd.exe`, which has no console window); `fsearch uninstall`
-removes it. The daemon indexes what your account can read. Run it elevated
+for `fsearchd.exe`, which has no console window, only the search bar);
+`fsearch uninstall` removes it, `fsearch stop` ends the running one. The daemon indexes what your account can read. Run it elevated
 and it turns on the backup privilege and indexes everything; set
 `FSEARCH_RESTRICT=1` to keep it to what you can read anyway.
 
