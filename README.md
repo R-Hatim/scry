@@ -1,80 +1,91 @@
 # FSearch
 
-Whole-disk file search for macOS. Finds any file by name in about a
-millisecond, forgives typos, and searches inside files with an index. Use it
-as a CLI (with a small daemon) or as a Rust crate.
+Whole-disk file search for Windows. Finds any file on your fixed drives by
+name in about a millisecond, forgives typos, and searches inside your text
+files with an index. Use it as a CLI (with a small daemon) or as a Rust
+crate.
+
+A Windows port of [noahdunnagan/fsearch](https://github.com/noahdunnagan/fsearch),
+which is macOS-only.
 
 ```
-cargo build --release && ./target/release/fsearch install   # -> ~/.local/bin/fsearch
-fsearch fsearch main              # find files by name
-fsearch 'ext:rs grep:apply_dir'   # search inside files
+cargo build --release
+target\release\fsearch install          # -> %USERPROFILE%\.local\bin
+fsearch fsearch main                    # find files by name
+fsearch "ext:rs grep:apply_dir"         # search inside files
 ```
 
 ## Speed
 
-M4 Max, 7.7M files and folders on disk.
+i7-11850H laptop, NVMe, Defender on, 5.0M files and folders on C:.
 
 | | |
 |---|---|
-| find a file by name, whole disk | p50 1.3 ms |
-| search inside files | p50 9 ms |
+| find a file by name, whole disk | median 0.07-0.6 ms (one word), ~5 ms (two) |
+| search inside files | 1-15 ms |
 | a new, renamed or deleted file shows up | ~0.1 s |
-| first crawl of the disk | ~20 s, once |
-| daemon memory | 30-135 MB |
-
-## vs fff
-
-Chromium (509k files), same Mac, same queries. Video:
-[`demo/fsearch-vs-fff.mp4`](demo/fsearch-vs-fff.mp4), method:
-[`demo/vs_fff.py`](demo/vs_fff.py).
-
-| | fsearch | [fff](https://github.com/dmtrKovalenko/fff) |
-|---|---|---|
-| find a file by name | 1.1 ms | 13.8 ms |
-| search inside files | 5.6 ms | 53 ms |
-| typo still finds the file first | 98% | 88% |
-| ready after launch | 50 ms | 2.5 s |
-| memory | 50 MB (whole disk) | 358 MB (that folder) |
-
-On the smaller Linux kernel (96k files), name search is a tie and fsearch
-wins the rest. fff searches the contents of about 9% more files, because
-fsearch skips some file types and `build/` and `vendor/` folders.
+| first crawl of the disk | ~80 s, once |
+| start after a reboot | at once, caught up ~0.2 s later |
+| daemon memory | ~12 MB, plus the index mapped from disk (~200 MB, evictable) |
 
 ## Queries
 
 ```
-fsearch 'readme in:~/Developer'          # inside a folder
-fsearch 'type:image size:>5mb mtime:<7d'
-fsearch 'ext:rs regex:fn\s+\w+_dir'      # regex inside files
-fsearch 'sym:apply_dir'                  # where it's defined
+fsearch "readme in:C:\Workspace"         # inside a folder
+fsearch "type:image size:>5mb mtime:<7d"
+fsearch "type:app code"                  # programs and Start Menu shortcuts
+fsearch "ext:rs regex:fn\s+\w+_dir"      # regex inside files
+fsearch "sym:apply_dir"                  # where it's defined
 ```
 
 Words are fuzzy, and 5+ letter words forgive one typo (`mian.rs` finds
-`main.rs`). Also `'exact`, `^prefix`, `suffix$` and `!exclude`. Filters:
-`ext:` `type:` `kind:` `in:` `size:` `mtime:` `re:` `path:` `grep:` `regex:`
-`sym:` `limit:`. Content search is smart-case.
+`main.rs`). A `\` or `/` splits a word into folder tokens (`src\main`).
+Also `'exact`, `^prefix`, `suffix$` and `!exclude`. Filters: `ext:` `type:`
+`kind:` `in:` `size:` `mtime:` `re:` `path:` `grep:` `regex:` `sym:`
+`limit:`. Quote paths with spaces: `in:"C:\Program Files"`. `path:` regexes
+see `C:/Users/...`, with forward slashes. Content search is smart-case.
 
-## Full Disk Access
+## Your folders
 
-Started from a terminal with Full Disk Access, it indexes everything. As a
-login item (`fsearch install --login`), give `~/.local/bin/fsearch` its own
-grant in System Settings > Privacy & Security, again after each rebuild.
-Without access it skips the protected folders instead of popping a prompt.
+Content search covers the text files in your folders, and what is in them
+ranks first. By default that is your user folder; add your own in
+`%LOCALAPPDATA%\FSearch\config.json`, then `fsearch stop` (the next search
+restarts the daemon):
+
+```json
+{"roots": ["~", "C:\\Workspace"], "skip": ["D:\\Backups"]}
+```
+
+`skip` lists folders never to open. Folders outside your roots are still
+searched by name, and `grep:` with an `in:` there reads the files directly.
+Build output, dependencies and app data (`node_modules`, `.git`, `obj`,
+`AppData`, ...) are left out of the content index, and OneDrive files that
+are online-only are never downloaded by a search.
+
+## Login item and elevation
+
+`fsearch install --login` also starts the daemon at login (a `Run` entry
+for `fsearchd.exe`, which has no console window); `fsearch uninstall`
+removes it. The daemon indexes what your account can read. Run it elevated
+and it turns on the backup privilege and indexes everything; set
+`FSEARCH_RESTRICT=1` to keep it to what you can read anyway.
 
 ## API
 
-JSON lines over `~/Library/Application Support/FSearch/fsearch.sock`, or
-`fsearch stdio`:
+JSON lines over a named pipe (`fsearch::server::pipe_name`), or `fsearch stdio`:
 
 ```json
 {"q": "fsearch main", "limit": 20}
-{"op": "grep", "pattern": "apply_dir", "in": "~/Developer"}
+{"op": "grep", "pattern": "apply_dir", "in": "~\\Developer"}
+{"op": "status"}
 ```
 
 Or link the crate:
 
 ```rust
-let engine = fsearch::Engine::start(fsearch::Options { dir: fsearch::default_dir(&home), home: home.clone(), skip: None })?;
+let home = fsearch::default_home();
+let opts = fsearch::server::options(&fsearch::default_dir(&home), &home);
+let engine = fsearch::Engine::start(opts)?;
 let hits = engine.search(&fsearch::Query::parse("fsearch main", &home)?)?;
 ```
 
@@ -83,9 +94,23 @@ others follow along.
 
 ## How it works
 
-- Crawls the disk once with `getattrlistbulk`, then stays current from
-  FSEvents. A restart replays only what changed.
+- Crawls every fixed drive once. Each folder is opened relative to its
+  parent's handle (`NtOpenFile`, NT's `openat`) and listed in bulk with
+  `GetFileInformationByHandleEx`: names, sizes and times in a few calls per
+  folder, no per-file stat. Junctions, symlinks and mount points are kept
+  as entries, never entered.
+- Stays current from `ReadDirectoryChangesW` on every drive root. Each
+  change names a folder, which is relisted and diffed against the index.
+- After a restart, or when more changed at once than the change buffer
+  holds, the NTFS change journal (readable without admin) names the folders
+  that changed since the index was last in sync. Drives without one are
+  checked folder by folder.
 - Names live in one mmap'd file, laid out folder by folder so `in:` is a
   range. Each distinct name is scored once.
 - Content search uses a trigram index of your text files. Matches are read
   fresh from disk, so they're never stale.
+
+## Building
+
+Rust 1.89+ with the MSVC toolchain, Windows 10 1809 or later. `cargo test`
+runs against throwaway folders in `%TEMP%`.
