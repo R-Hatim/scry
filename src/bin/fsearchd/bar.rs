@@ -2,12 +2,13 @@
 //! brings up a box in the middle of the screen. Results come as you type;
 //! Up/Down picks one, Enter opens it, Ctrl+Enter shows it in Explorer, Esc
 //! or a click elsewhere puts the bar away. The whole query language works
-//! (`ext:pdf invoice`, `in:~\Documents report`, `grep:TODO`).
+//! (`ext:pdf invoice`, `in:~\Documents report`, `grep:TODO`), and when no
+//! file name matches, the words are looked for inside files.
 //!
 //! Searches run on a worker thread, which also looks up the icons (shell
 //! calls that may block), so typing never waits on either.
 
-use fsearch::{Engine, Grep, Query, paths, walk};
+use fsearch::{Engine, Grep, GrepMode, Query, paths, walk};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
@@ -692,6 +693,10 @@ fn worker(work: &Work, engine: &Engine, home: &str, target: isize) {
     }
 }
 
+/// Shortest text looked for inside files when no name matches: below a
+/// trigram, the content index can't narrow anything down.
+const FALLBACK_MIN: usize = 3;
+
 fn search(engine: &Engine, home: &str, text: &str, icons: &mut Icons) -> Vec<Row> {
     let message = |m: String| vec![Row { path: None, name: m, detail: String::new(), icon: -1 }];
     let mut q = match Query::parse(text, home) {
@@ -699,36 +704,49 @@ fn search(engine: &Engine, home: &str, text: &str, icons: &mut Icons) -> Vec<Row
         Err(e) => return message(e),
     };
     q.limit = LIMIT;
-    let rows: Vec<Row> = match q.grep.take() {
-        Some(pattern) => match Grep::new(&pattern, q.grep_mode).and_then(|g| engine.grep(&q, &g)) {
-            Ok((r, _)) => r
-                .files
-                .iter()
-                .map(|f| {
-                    let path = paths::to_native(&f.path);
-                    let (n, line) = f.lines.first().map_or((0, ""), |(n, l)| (*n, l.trim()));
-                    Row {
-                        name: name_of(&path),
-                        detail: format!("{}  ·  {n}: {line}", parent_of(&path)),
-                        icon: icons.of(&path, false),
-                        path: Some(path),
-                    }
-                })
-                .collect(),
-            Err(e) => return message(e),
-        },
+    let rows = match q.grep.take() {
+        Some(pattern) => content(engine, &q, &pattern, q.grep_mode, icons),
         None => match engine.search(&q) {
-            Ok(found) => found
+            Ok(found) if found.is_empty() => {
+                // No file is called that: look for it inside files (the
+                // filters still choose which), as if typed with grep:.
+                let words = Query::plain_words(text, home);
+                let words = words.trim();
+                if words.chars().count() < FALLBACK_MIN {
+                    return message("No results".into());
+                }
+                q.tokens.clear();
+                content(engine, &q, words, GrepMode::Literal, icons)
+            }
+            Ok(found) => Ok(found
                 .into_iter()
                 .map(|f| {
                     let dir = f.kind & 3 == walk::KIND_DIR;
                     Row { name: name_of(&f.path), detail: parent_of(&f.path), icon: icons.of(&f.path, dir), path: Some(f.path) }
                 })
-                .collect(),
-            Err(e) => return message(e),
+                .collect()),
+            Err(e) => Err(e),
         },
     };
-    if rows.is_empty() { message("No results".into()) } else { rows }
+    match rows {
+        Ok(rows) if rows.is_empty() => message("No results".into()),
+        Ok(rows) => rows,
+        Err(e) => message(e),
+    }
+}
+
+/// Files containing `pattern`, among those `q` picks: a row per file, with
+/// its folder and the first matching line.
+fn content(engine: &Engine, q: &Query, pattern: &str, mode: GrepMode, icons: &mut Icons) -> Result<Vec<Row>, String> {
+    let (r, _) = Grep::new(pattern, mode).and_then(|g| engine.grep(q, &g))?;
+    Ok(r.files
+        .iter()
+        .map(|f| {
+            let path = paths::to_native(&f.path);
+            let (n, line) = f.lines.first().map_or((0, ""), |(n, l)| (*n, l.trim()));
+            Row { name: name_of(&path), detail: format!("{}  ·  {n}: {line}", parent_of(&path)), icon: icons.of(&path, false), path: Some(path) }
+        })
+        .collect())
 }
 
 fn name_of(p: &Path) -> String {

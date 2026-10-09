@@ -21,7 +21,9 @@ fsearch "ext:rs grep:apply_dir"         # search inside files
 Results come as you type; Up/Down picks one, **Enter** opens it,
 **Ctrl+Enter** shows it in Explorer, **Esc** (or a click elsewhere) puts
 the bar away. The whole query language works in it (`ext:pdf invoice`,
-`grep:TODO in:C:\Workspace`).
+`grep:TODO in:C:\Workspace`), and when no file name matches, it looks for
+the words inside your files instead (filters still apply: `ext:cs
+SendInvoiceMail`).
 
 The bar lives in the daemon, `fsearchd.exe`: it is there whenever the
 daemon runs (at login with `install --login`, or from the first search).

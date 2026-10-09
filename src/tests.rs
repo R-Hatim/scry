@@ -300,6 +300,13 @@ fn content_search_reads_crlf_text() {
 }
 
 #[test]
+fn plain_words_leave_out_filters() {
+    assert_eq!(Query::plain_words(r"ext:cs ProcessAssignment in:C:\Windows mail", r"C:\"), "ProcessAssignment mail");
+    assert_eq!(Query::plain_words("size:>lots Foo", ""), "Foo", "a filter with a bad value is still a filter");
+    assert_eq!(Query::plain_words(r"C:\x foo", ""), r"C:\x foo", "a drive letter is not a filter");
+}
+
+#[test]
 fn query_reads_windows_paths() {
     let q = Query::parse(r#"in:"C:\Windows\System32" drivers\etc"#, r"C:\Users\me").unwrap();
     assert_eq!(q.scope.as_deref(), Some(&b"/C:/Windows/System32"[..]));

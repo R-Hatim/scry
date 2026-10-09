@@ -184,6 +184,16 @@ impl Query {
         Query { grep: None, ..self.clone() }
     }
 
+    /// The words of a query that are not filters, as typed (`ext:cs Foo
+    /// bar` gives `Foo bar`): what to look for inside files when no file
+    /// name matches.
+    pub fn plain_words(s: &str, home: &str) -> String {
+        let mut scratch = Query::default();
+        // A filter key with a bad value is still a filter.
+        let mut filter = |w: &str| w.split_once(':').is_some_and(|(k, v)| scratch.filter(k, v, home).unwrap_or(true));
+        split_words(s).into_iter().filter(|w| !filter(w)).collect::<Vec<_>>().join(" ")
+    }
+
     /// Does a full path pass every filter and token? Returns the match score.
     /// Used where there is no dir memo: the overlay and content-search docs.
     pub fn match_path(&self, path: &[u8], kind: u8, size: u64, mtime: u32) -> Option<i32> {
