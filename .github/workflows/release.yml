@@ -1,0 +1,52 @@
+# A version tag (v0.1.0) builds the installer and a portable zip and
+# attaches them, with their checksums, to a draft release to review and
+# publish by hand. The tag must match the version in Cargo.toml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Version from the tag
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($v -ne $cargo) { throw "the tag says $v but Cargo.toml says $cargo" }
+          "VERSION=$v" >> $env:GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc /Q "/DAppVersion=$env:VERSION" installer\scry.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Portable zip and checksums
+        shell: pwsh
+        run: |
+          $dist = New-Item -ItemType Directory -Force target\dist
+          Copy-Item "target\installer\scry-$env:VERSION-setup-x64.exe" $dist
+          Compress-Archive -Path target\release\scry.exe, target\release\scryd.exe, README.md, LICENSE -DestinationPath "$dist\scry-$env:VERSION-x64.zip"
+          $sums = Get-ChildItem $dist | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name }
+          $sums | Set-Content "$dist\SHA256SUMS.txt"
+
+      - name: Draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" (Get-ChildItem target\dist).FullName --draft --title "Scry $env:VERSION" --notes-file .github\release-notes.md
