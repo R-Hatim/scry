@@ -437,3 +437,113 @@ fn folders_add_up_and_sort_by_size() {
     assert_eq!(Query::parse("sort:newest", r"C:\").unwrap().order, crate::query::Order::Date);
     assert!(Query::parse("sort:colour", r"C:\").is_err());
 }
+
+/// A ZIP of stored (uncompressed) entries, as an Office file is laid out.
+fn zip_stored(files: &[(&str, &str)]) -> Vec<u8> {
+    let (mut z, mut central) = (Vec::new(), Vec::new());
+    let le16 = |v: usize| (v as u16).to_le_bytes();
+    let le32 = |v: usize| (v as u32).to_le_bytes();
+    for (name, data) in files {
+        let at = z.len();
+        z.extend(b"PK\x03\x04");
+        z.extend([20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        z.extend(le32(data.len()));
+        z.extend(le32(data.len()));
+        z.extend(le16(name.len()));
+        z.extend(le16(0));
+        z.extend(name.as_bytes());
+        z.extend(data.as_bytes());
+        central.extend(b"PK\x01\x02");
+        central.extend([20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        central.extend(le32(data.len()));
+        central.extend(le32(data.len()));
+        central.extend(le16(name.len()));
+        central.extend([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        central.extend(le32(at));
+        central.extend(name.as_bytes());
+    }
+    let cd = z.len();
+    z.extend(&central);
+    z.extend(b"PK\x05\x06\0\0\0\0");
+    z.extend(le16(files.len()));
+    z.extend(le16(files.len()));
+    z.extend(le32(central.len()));
+    z.extend(le32(cd));
+    z.extend([0, 0]);
+    z
+}
+
+/// The smallest PDF with `text` on its one page, cross-reference table and all.
+fn tiny_pdf(text: &str) -> Vec<u8> {
+    let content = format!("BT /F1 18 Tf 20 100 Td ({text}) Tj ET");
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".into(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into(),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).bytes());
+    for o in offsets {
+        pdf.extend(format!("{o:010} 00000 n \n").bytes());
+    }
+    pdf.extend(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).bytes());
+    pdf
+}
+
+const DOCX_XML: &str = "<w:document><w:body><w:p><w:r><w:t>Quokka &amp; friends</w:t></w:r><w:r><w:tab/><w:t>tabbed</w:t></w:r></w:p>\
+<w:p><w:r><w:instrText>HYPERLINK nowhere</w:instrText><w:t>Second &#x2192; line</w:t></w:r></w:p></w:body></w:document>";
+
+#[test]
+fn documents_give_their_text() {
+    let t = Tree::new("docs");
+    std::fs::write(t.root.join("notes.docx"), zip_stored(&[("[Content_Types].xml", "<Types/>"), ("word/document.xml", DOCX_XML)])).unwrap();
+    let text = |rel: &str, kind| {
+        let mut out = Vec::new();
+        let f = std::fs::File::open(t.root.join(rel)).unwrap();
+        crate::docs::text(&t.at(rel), kind, f, &mut out).then(|| String::from_utf8(out).unwrap())
+    };
+    assert_eq!(text("notes.docx", crate::docs::Kind::Word).as_deref(), Some("Quokka & friends\ttabbed\nSecond → line\n"), "field codes left out");
+
+    let mut odt = Vec::new();
+    crate::docs::xml_text(b"<office:text><text:p>One<text:s/>two</text:p><text:h>Title<text:line-break/>next</text:h></office:text>", &mut odt);
+    assert_eq!(String::from_utf8(odt).unwrap(), "One two\nTitle\nnext\n");
+
+    std::fs::write(t.root.join("tiny.pdf"), tiny_pdf("Hello quokka")).unwrap();
+    match text("tiny.pdf", crate::docs::Kind::Pdf) {
+        Some(s) => assert!(s.contains("Hello quokka"), "{s:?}"),
+        None => eprintln!("no PDF filter here: skipped"),
+    }
+}
+
+#[test]
+fn search_inside_documents() {
+    let t = Tree::new("doc-search");
+    std::fs::write(t.root.join("notes.docx"), zip_stored(&[("word/document.xml", DOCX_XML)])).unwrap();
+    std::fs::write(t.root.join("brief.pdf"), tiny_pdf("Hello quokka")).unwrap();
+    let idx = Tree::new("doc-search-idx");
+    let live = live_of(&t);
+    let roots = std::slice::from_ref(&t.ip);
+    let mut c = Content::open(idx.root.join("content"));
+    let todo = c.diff(content::wants(&live, roots, &[], roots));
+    for b in todo.batches() {
+        let (dir, id) = (c.dir.clone(), c.alloc_id());
+        c.push(content::build_segment(&dir, id, &todo, b).unwrap());
+    }
+    let q = Query::parse("", r"C:\").unwrap();
+    let found = c.search(&Grep::new("quokka", GrepMode::Literal).unwrap(), &q).files;
+    let names: Vec<String> = found.iter().map(|f| Path::new(&paths::display(&f.path)).file_name().unwrap().to_string_lossy().into_owned()).collect();
+    assert!(names.contains(&"notes.docx".to_string()), "{names:?}");
+    let docx = found.iter().find(|f| paths::display(&f.path).ends_with("notes.docx")).unwrap();
+    assert_eq!(docx.lines[0], (1, "Quokka & friends\ttabbed".to_string()), "the paragraph that matched");
+    if !names.contains(&"brief.pdf".to_string()) {
+        eprintln!("no PDF filter here: the PDF was not searched");
+    }
+}

@@ -401,7 +401,6 @@ struct Split {
 /// Build one segment file from docs (any order). Files that turn out not
 /// to be text are recorded with no trigrams.
 pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<usize>) -> Option<Segment> {
-    use std::io::Read;
     let splits: Vec<Split> = range
         .clone()
         .into_par_iter()
@@ -409,10 +408,7 @@ pub fn build_segment(dir: &Path, id: u64, docs: &Docs, range: std::ops::Range<us
         .fold(
             || Split { seen: vec![0u64; (1 << 24) / 64], buf: Vec::new(), flat: Vec::new(), syms: Vec::new(), docs: Vec::new() },
             |mut sp, i| {
-                sp.buf.clear();
-                let ok = open_regular(docs.path(i))
-                    .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut sp.buf).ok())
-                    .is_some_and(|n| n as u64 <= MAX_FILE && memchr::memchr(0, &sp.buf[..n.min(8192)]).is_none());
+                let ok = read_text(docs.path(i), MAX_FILE, &mut sp.buf);
                 let (start, sym) = (sp.flat.len() as u32, sp.syms.len() as u32);
                 if ok {
                     trigrams(&sp.buf, &mut sp.seen, &mut sp.flat);
@@ -630,6 +626,10 @@ pub fn eligible(path: &[u8], size: u64, roots: &[Vec<u8>]) -> bool {
 
 /// The name/size half of eligibility, checkable before building a path.
 fn name_ok(name: &[u8], size: u64) -> bool {
+    // Word, Excel, PowerPoint, OpenDocument, PDF: their text, not their bytes.
+    if crate::docs::kind(name).is_some() {
+        return size <= crate::docs::MAX_DOC;
+    }
     if size > MAX_FILE {
         return false;
     }
@@ -1038,10 +1038,7 @@ thread_local! {
 
 fn match_file(g: &Grep, path: &[u8]) -> Option<FileMatches> {
     READ_BUF.with_borrow_mut(|buf| {
-        use std::io::Read;
-        buf.clear();
-        open_regular(path)?.take(MAX_FILE * 4).read_to_end(buf).ok()?;
-        if memchr::memchr(0, &buf[..buf.len().min(8192)]).is_some() {
+        if !read_text(path, MAX_FILE * 4, buf) {
             return None;
         }
         let mut lines = Vec::new();
@@ -1267,6 +1264,20 @@ pub fn scan_paths(live: &Live, mut q: Query) -> Vec<Vec<u8>> {
 /// the open, then the attributes say whether the data is here. (Links never
 /// get here: only entries of file kind are indexed or scanned.) The path is
 /// verbatim, so `name.` and `name ` open themselves, not `name`.
+/// What search inside files reads of a file, into `buf`: a text file's
+/// first `limit` bytes (false if it turns out to be binary), a document's
+/// text (Word, Excel, PowerPoint, OpenDocument, PDF).
+fn read_text(path: &[u8], limit: u64, buf: &mut Vec<u8>) -> bool {
+    use std::io::Read;
+    buf.clear();
+    let Some(f) = open_regular(path) else { return false };
+    let name = &path[path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1)..];
+    if let Some(kind) = crate::docs::kind(name) {
+        return crate::docs::text(path, kind, f, buf);
+    }
+    f.take(limit).read_to_end(buf).is_ok() && memchr::memchr(0, &buf[..buf.len().min(8192)]).is_none()
+}
+
 pub fn open_regular(path: &[u8]) -> Option<std::fs::File> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};

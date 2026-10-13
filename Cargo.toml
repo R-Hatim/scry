@@ -11,6 +11,8 @@ rust-version = "1.89"
 rayon = "1.12"
 memchr = "2.8"
 memmap2 = "0.9"
+# Office and OpenDocument files are deflated ZIP archives.
+miniz_oxide = "0.8"
 regex = "1.12"
 regex-syntax = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -22,6 +24,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    # Text out of PDFs, through the filter Windows registers for them.
+    "Win32_Storage_IndexServer",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Ioctl",

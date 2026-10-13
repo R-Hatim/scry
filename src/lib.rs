@@ -5,6 +5,7 @@
 //! a named pipe, which the `scry` command talks to.
 
 pub mod content;
+mod docs;
 mod engine;
 pub mod index;
 pub mod live;
