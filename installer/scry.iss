@@ -62,7 +62,12 @@ Name: "{autoprograms}\Scry"; Filename: "{app}\scryd.exe"; Comment: "Search every
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "scry"; ValueData: """{app}\scryd.exe"""; Flags: uninsdeletevalue; Tasks: login
 
 [Run]
-Filename: "{app}\scryd.exe"; Description: "Start Scry now"; Flags: nowait postinstall
+; Offered on the last page of an interactive install. A silent one (winget,
+; an upgrade) starts Scry again only if it was running before: to whatever
+; waits for the install to finish, a process the installer leaves running
+; looks like an install that never ends.
+Filename: "{app}\scryd.exe"; Description: "Start Scry now"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\scryd.exe"; Flags: nowait skipifnotsilent; Check: WasRunning
 
 [UninstallRun]
 ; Stops Scry and removes the login item; the index stays.
@@ -115,12 +120,22 @@ begin
   end;
 end;
 
+var
+  Running: Boolean;
+
+{ Scry was running when the install began (its tray window exists). }
+function WasRunning(): Boolean;
+begin
+  Result := Running;
+end;
+
 { A running Scry (an earlier version, or one started from elsewhere) holds
   its files: ask it to stop, with the scry.exe being installed. }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Code: Integer;
 begin
+  Running := FindWindowByClassName('scry-tray') <> 0;
   ExtractTemporaryFile('scry.exe');
   Exec(ExpandConstant('{tmp}\scry.exe'), 'stop', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Result := '';
