@@ -76,6 +76,7 @@ runs; the rest was measured through the daemon.
 | with a filter (`ext:pdf invoice`) | 0.07 ms |
 | search inside files, warm | 2-10 ms for words, ~60 ms for a regex |
 | search inside files, cold disk cache | up to ~1.5 s (matches are read fresh from disk) |
+| the largest folders on the whole disk (`kind:dir sort:size`) | 8-20 ms (60 ms the first time) |
 | a new, renamed or deleted file shows up | ~0.1 s |
 | first crawl of the disk | 50-80 s, once |
 | start after a reboot | searchable at once, caught up 0.05-0.5 s later |
@@ -89,13 +90,18 @@ scry "type:image size:>5mb mtime:<7d"
 scry "type:app code"                  # programs and Start Menu shortcuts
 scry "ext:rs regex:fn\s+\w+_dir"      # regex inside files
 scry "sym:apply_dir"                  # where it's defined
+scry "kind:dir sort:size in:~"         # the biggest folders in your user folder
+scry "kind:file sort:size"             # the largest files on every drive
+scry "ext:log sort:date"               # the newest logs
 ```
 
 Words are fuzzy, and 5+ letter words forgive one typo (`mian.rs` finds
 `main.rs`). A `\` or `/` splits a word into folder tokens (`src\main`).
 Also `'exact`, `^prefix`, `suffix$` and `!exclude`. Filters: `ext:` `type:`
 `kind:` `in:` `size:` `mtime:` `re:` `path:` `grep:` `regex:` `sym:`
-`limit:`. Quote paths with spaces: `in:"C:\Program Files"`. `path:` regexes
+`limit:` `sort:`. `sort:size` puts the largest first, a folder counting
+everything under it (sizes as files report them: a hard-linked file counts
+each time); `sort:date` the most recently modified. Quote paths with spaces: `in:"C:\Program Files"`. `path:` regexes
 see `C:/Users/...`, with forward slashes. Content search is smart-case.
 
 ## Your folders

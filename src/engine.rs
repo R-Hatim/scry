@@ -5,7 +5,7 @@
 use crate::content::{self, Content, Grep, GrepResult};
 use crate::index::Index;
 use crate::live::{Applied, Live};
-use crate::query::{Query, Searcher};
+use crate::query::{Order, Query, Searcher};
 use crate::watch::{self, DROPPED, HISTORY_DONE, MUST_SCAN_SUBDIRS};
 use crate::{paths, sys, walk};
 use std::collections::HashMap;
@@ -240,6 +240,9 @@ impl Engine {
         let g = self.s.live.read().unwrap();
         let Some(live) = g.as_ref() else { return Err(INDEXING.into()) };
         let mut p = Vec::new();
+        // Ordered by size, a folder's size is everything under it.
+        let sizes = (q.order == Order::Size).then(|| live.dir_sizes());
+        let is_dir = |k: u8| sizes.is_some() && k & 3 == walk::KIND_DIR;
         Ok(search_pool()
             .install(|| Searcher { live }.search(q))
             .into_iter()
@@ -248,12 +251,14 @@ impl Engine {
                     Some(path) => {
                         let o = live.over[path];
                         p = path.clone();
-                        (o.kind, o.size, o.mtime)
+                        (o.kind, if is_dir(o.kind) { live.over_size(path) } else { o.size }, o.mtime)
                     }
                     None => {
                         let i = h.idx as usize;
                         live.base.path(i, &mut p);
-                        (live.base.kind()[i], live.base.size_of(i), live.base.mtime()[i])
+                        let k = live.base.kind()[i];
+                        let folder = sizes.as_ref().zip(live.base.dir_of(i as u32)).map(|(s, d)| s[d as usize]);
+                        (k, if is_dir(k) { folder.unwrap_or(0) } else { live.base.size_of(i) }, live.base.mtime()[i])
                     }
                 };
                 Found { path: paths::to_native(&p), kind, size, mtime, score: h.score }

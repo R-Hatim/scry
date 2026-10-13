@@ -9,6 +9,7 @@
 use crate::index::{Index, enc_size};
 use crate::walk::{self, FLAG_MOUNT, KIND_DIR, Listing, NONE, RawEnt};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy)]
 pub struct OEnt {
@@ -30,6 +31,9 @@ impl OEnt {
     }
 }
 
+/// Folder sizes by dir id, and the (dead, overlay, changes) they were taken at.
+type DirSizes = Option<((usize, usize, u64), Arc<Vec<u64>>)>;
+
 pub struct Live {
     pub base: Index,
     dead: Vec<u64>,
@@ -46,6 +50,12 @@ pub struct Live {
     pub synced_at: u32,
     /// Overlay folder -> prior of its nearest base folder.
     priors: HashMap<Vec<u8>, i8>,
+    /// Bumped by every overlay write, so cached folder sizes know they are stale.
+    changes: u64,
+    /// `dir_sizes`, and the (dead, overlay, changes) it was computed at.
+    dir_sizes: Mutex<DirSizes>,
+    /// Folder sizes of the base alone, computed once.
+    base_sizes: std::sync::OnceLock<Arc<Vec<u64>>>,
 }
 
 /// What `Live::fetch` read from disk for one folder update.
@@ -84,6 +94,9 @@ impl Live {
             names_cache: Default::default(),
             synced_at,
             priors: HashMap::new(),
+            changes: 0,
+            dir_sizes: Mutex::new(None),
+            base_sizes: std::sync::OnceLock::new(),
         }
     }
 
@@ -107,6 +120,7 @@ impl Live {
             }
         };
         self.over.insert(path, e);
+        self.changes += 1;
     }
 
     #[inline]
@@ -152,6 +166,100 @@ impl Live {
             self.kill_subtree(e);
         }
         self.drop_over_subtree(path);
+    }
+
+    /// Every base folder's size (by dir id): the files under it, leaving out
+    /// the ones gone since the base was saved and counting the ones added.
+    /// The base's own sizes are added up once; each change since is then
+    /// carried up its folders (a few thousand steps, not millions). Cached
+    /// until the index changes.
+    pub fn dir_sizes(&self) -> Arc<Vec<u64>> {
+        let base = self.base_sizes.get_or_init(|| Arc::new(self.add_up_base()));
+        if self.dead_count == 0 && self.over.is_empty() {
+            return base.clone();
+        }
+        let at = (self.dead_count, self.over.len(), self.changes);
+        let mut cache = self.dir_sizes.lock().unwrap();
+        if let Some((when, sizes)) = cache.as_ref()
+            && *when == at
+        {
+            return sizes.clone();
+        }
+        let idx = &self.base;
+        let (kind, parent, de) = (idx.kind(), idx.parent(), idx.dir_entry());
+        let mut t = (**base).clone();
+        // `d` and every folder above it, up to the root (ids only go down).
+        let carry = |t: &mut Vec<u64>, mut d: usize, size: u64, add: bool| loop {
+            t[d] = if add { t[d] + size } else { t[d].saturating_sub(size) };
+            let p = parent[de[d] as usize] as usize;
+            if p >= d {
+                break;
+            }
+            d = p;
+        };
+        for (w, &bits) in self.dead.iter().enumerate() {
+            let mut m = bits;
+            while m != 0 {
+                let i = w * 64 + m.trailing_zeros() as usize;
+                m &= m - 1;
+                if i < idx.n && kind[i] & 3 == walk::KIND_FILE {
+                    carry(&mut t, parent[i] as usize, idx.size_of(i), false);
+                }
+            }
+        }
+        // Files added since: into the nearest folder the base has.
+        let mut nearest: HashMap<&[u8], Option<u32>> = HashMap::new();
+        for (path, o) in &self.over {
+            if o.kind & 3 != walk::KIND_FILE {
+                continue;
+            }
+            let dir = &path[..path.iter().rposition(|&b| b == b'/').unwrap_or(0)];
+            let d = *nearest.entry(dir).or_insert_with(|| {
+                let mut up = dir;
+                loop {
+                    if let Some(d) = self.base_alive(up).and_then(|e| idx.dir_of(e)) {
+                        return Some(d);
+                    }
+                    if up.is_empty() {
+                        return None;
+                    }
+                    up = &up[..up.iter().rposition(|&b| b == b'/').unwrap_or(0)];
+                }
+            });
+            if let Some(d) = d {
+                carry(&mut t, d as usize, o.size, true);
+            }
+        }
+        let sizes = Arc::new(t);
+        *cache = Some((at, sizes.clone()));
+        sizes
+    }
+
+    /// The base's folder sizes: one pass over the entries, then one up the
+    /// folders (a folder's id always comes after its parent's).
+    fn add_up_base(&self) -> Vec<u64> {
+        let idx = &self.base;
+        let (kind, parent, de) = (idx.kind(), idx.parent(), idx.dir_entry());
+        let mut t = vec![0u64; idx.d];
+        for i in 0..idx.n {
+            if kind[i] & 3 == walk::KIND_FILE {
+                t[parent[i] as usize] += idx.size_of(i);
+            }
+        }
+        for d in (1..idx.d).rev() {
+            let p = parent[de[d] as usize] as usize;
+            if p < d {
+                t[p] += t[d];
+            }
+        }
+        t
+    }
+
+    /// The size of a folder added since the base was saved: the files under
+    /// it, all in the overlay.
+    pub fn over_size(&self, dir: &[u8]) -> u64 {
+        let (lo, hi) = subtree_bounds(dir);
+        self.over.range(lo..hi).filter(|(_, o)| o.kind & 3 == walk::KIND_FILE).map(|(_, o)| o.size).sum()
     }
 
     /// What changed since the base was saved, as bytes for
@@ -209,6 +317,7 @@ impl Live {
             return None;
         }
         (self.dead, self.dead_count, self.over, self.event_id, self.synced_at) = (dead, dead_count as usize, map, event_id, synced_at);
+        self.changes += 1;
         Some(())
     }
 

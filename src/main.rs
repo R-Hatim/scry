@@ -1,7 +1,7 @@
 //! The `scry` command: searches through the daemon (starting it when
 //! needed), runs it, installs it.
 
-use scry::{index, live, query, server};
+use scry::{Order, human_age, human_size, index, live, query, server};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -33,7 +33,7 @@ fn main() {
         None | Some("-h" | "--help") => eprintln!("{USAGE}"),
         Some("serve") => server::serve(data_dir(), home()),
         Some("stdio") => stdio(),
-        Some("status") => print_one(&json!({"op": "status"}), true),
+        Some("status") => print_one(&json!({"op": "status"}), true, Order::Relevance),
         Some("stop") => stop(true),
         Some("bench") => bench(&args[1..].join(" ")),
         Some("install") => install(args.iter().any(|a| a == "--login")),
@@ -41,12 +41,14 @@ fn main() {
         Some(_) => {
             let json = args.iter().any(|a| a == "--json");
             let q: Vec<&str> = args.iter().map(String::as_str).filter(|a| *a != "--json").collect();
-            print_one(&json!({"q": q.join(" ")}), json);
+            // Sorted by size or date: that comes first on each line.
+            let order = query::Query::parse(&q.join(" "), &home()).map_or(Order::Relevance, |q| q.order);
+            print_one(&json!({"q": q.join(" ")}), json, order);
         }
     }
 }
 
-fn print_one(req: &serde_json::Value, raw: bool) {
+fn print_one(req: &serde_json::Value, raw: bool, order: Order) {
     let mut s = server::connect(&data_dir()).unwrap_or_else(|e| die(&format!("cannot reach daemon: {e}")));
     writeln!(s, "{req}").unwrap();
     let mut line = String::new();
@@ -61,7 +63,12 @@ fn print_one(req: &serde_json::Value, raw: bool) {
     }
     let mut out = std::io::stdout().lock();
     for h in v["hits"].as_array().into_iter().flatten() {
-        let _ = writeln!(out, "{}", h["path"].as_str().unwrap_or(""));
+        let lead = match order {
+            Order::Relevance => String::new(),
+            Order::Size => format!("{:>8}  ", human_size(h["size"].as_u64().unwrap_or(0))),
+            Order::Date => format!("{:>14}  ", human_age(h["mtime"].as_u64().unwrap_or(0) as u32)),
+        };
+        let _ = writeln!(out, "{lead}{}", h["path"].as_str().unwrap_or(""));
     }
     for f in v["files"].as_array().into_iter().flatten() {
         for m in f["matches"].as_array().into_iter().flatten() {

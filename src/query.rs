@@ -59,10 +59,22 @@ pub struct Query {
     pub name_re: Option<regex::bytes::Regex>,
     pub path_re: Option<regex::bytes::Regex>,
     pub limit: usize,
+    /// What comes first: the best match (default), the largest, the newest.
+    pub order: Order,
     /// Content search: handled by the content layer, carried here so one
     /// query string can say everything.
     pub grep: Option<String>,
     pub grep_mode: GrepMode,
+}
+
+/// `sort:size` puts the largest first (a folder counts everything under
+/// it), `sort:date` the most recently modified.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub enum Order {
+    #[default]
+    Relevance,
+    Size,
+    Date,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
@@ -171,6 +183,14 @@ impl Query {
             "re" => self.name_re = Some(regex::bytes::Regex::new(&format!("(?i){v}")).map_err(|e| e.to_string())?),
             "path" => self.path_re = Some(regex::bytes::Regex::new(&format!("(?i){v}")).map_err(|e| e.to_string())?),
             "limit" => self.limit = v.parse().map_err(|_| "bad limit")?,
+            "sort" | "order" => {
+                self.order = match v.to_ascii_lowercase().as_str() {
+                    "size" | "largest" | "biggest" => Order::Size,
+                    "date" | "mtime" | "modified" | "newest" | "recent" => Order::Date,
+                    "relevance" | "best" | "score" => Order::Relevance,
+                    _ => return Err(format!("sort:{v}: size, date or relevance")),
+                }
+            }
             "grep" | "content" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Literal),
             "regex" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Regex),
             "sym" | "symbol" => (self.grep, self.grep_mode) = (Some(v.to_string()), GrepMode::Symbol),
@@ -600,6 +620,17 @@ struct TopK {
     floor: u64,
 }
 
+/// A size as a score that sorts the same way (`enc_size`'s 4 bytes, shifted
+/// into i32), for `sort:size`.
+fn size_key(s: u64) -> i32 {
+    (crate::index::enc_size(s) as i64 + i32::MIN as i64) as i32
+}
+
+/// A modification time as a score that sorts the same way, for `sort:date`.
+fn date_key(t: u32) -> i32 {
+    (t as i64 + i32::MIN as i64) as i32
+}
+
 #[inline(always)]
 fn key(score: i32, i: u32) -> u64 {
     (((score as i64 - i32::MIN as i64) as u64) << 32) | (!i) as u64
@@ -702,7 +733,16 @@ impl Searcher<'_> {
         // Step 1: every name-only predicate, once per distinct name (~2M)
         // rather than once per entry (~7.5M); reused while you type.
         let scored = self.names(q, &pos, &neg);
-        let s = Scan { q, live: self.live, names: &scored.names, npos: pos.len(), need_dirs: pos.len() > 1 || !neg.is_empty(), now: now_secs() };
+        let sizes = (q.order == Order::Size).then(|| self.live.dir_sizes());
+        let s = Scan {
+            q,
+            live: self.live,
+            names: &scored.names,
+            npos: pos.len(),
+            need_dirs: pos.len() > 1 || !neg.is_empty(),
+            now: now_secs(),
+            sizes: sizes.as_deref().map(Vec::as_slice),
+        };
         // Step 2: score entries. Few candidates: just the entries carrying a
         // matching name. Many: one sequential pass over every entry.
         if scored.names.ok_entries <= SELECTIVE && !FULL_PASS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -850,7 +890,11 @@ impl Searcher<'_> {
                     let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
                     let dir = &path[..cut];
                     if let Some(score) = q.match_path_with(path, o.kind, o.size, o.mtime, |_| *memo.entry(dir).or_insert_with(|| q.dir_match(dir))) {
-                        let score = score + o.prior as i32 + rank_tweaks(name_flags(&path[cut + 1..]), o.kind, o.mtime, now);
+                        let score = match q.order {
+                            Order::Relevance => score + o.prior as i32 + rank_tweaks(name_flags(&path[cut + 1..]), o.kind, o.mtime, now),
+                            Order::Size => size_key(if o.kind & 3 == KIND_DIR { self.live.over_size(path) } else { o.size }),
+                            Order::Date => date_key(o.mtime),
+                        };
                         out.push(Hit { score, idx: u32::MAX, over: Some(path.clone()) });
                     }
                     (out, memo)
@@ -922,6 +966,8 @@ struct Scan<'a> {
     npos: usize,
     need_dirs: bool,
     now: u32,
+    /// Every base folder's size, when ordering by size.
+    sizes: Option<&'a [u64]>,
 }
 
 impl Scan<'_> {
@@ -963,6 +1009,14 @@ impl Scan<'_> {
         }
         let p = idx.parent()[i] as usize;
         score += idx.dir_prior()[p] as i32 + rank_tweaks(nh.flags, k, mtime, self.now);
+        match q.order {
+            Order::Relevance => {}
+            Order::Size => {
+                let folder = |d: u32| self.sizes.map_or(0, |s| s[d as usize]);
+                score = size_key(if k & 3 == KIND_DIR { idx.dir_of(i as u32).map_or(0, folder) } else { idx.size_of(i) });
+            }
+            Order::Date => score = date_key(mtime),
+        }
         let key = key(score, i as u32);
         if key <= floor {
             return None;
@@ -1263,4 +1317,30 @@ fn rank_tweaks(flags: u8, kind: u8, mtime: u32, now: u32) -> i32 {
         _ => 0,
     };
     s
+}
+
+/// 1536 as "1.5 KB", 3_400_000_000 as "3.2 GB": one decimal under 10.
+pub fn human_size(s: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let (mut v, mut u) = (s as f64, 0);
+    while v >= 1024.0 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 || v >= 10.0 { format!("{v:.0} {}", UNITS[u]) } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+/// How long ago Unix second `t` was: "5 min ago", "3 h ago", "12 days ago".
+pub fn human_age(t: u32) -> String {
+    let s = now_secs().saturating_sub(t);
+    let (n, unit) = match s {
+        0..60 => return "just now".into(),
+        60..3600 => (s / 60, "min"),
+        3600..86_400 => (s / 3600, "h"),
+        86_400..2_592_000 => (s / 86_400, "day"),
+        2_592_000..31_536_000 => (s / 2_592_000, "month"),
+        _ => (s / 31_536_000, "year"),
+    };
+    let plural = if n > 1 && unit.len() > 3 { "s" } else { "" };
+    format!("{n} {unit}{plural} ago")
 }

@@ -114,7 +114,18 @@ pub fn create(engine: Engine, hotkey: Option<String>, dir: PathBuf) {
         LoadIconMetric(inst, 1 as _, LIM_LARGE, &mut large);
         let latest = Arc::new(Mutex::new(Counts::default()));
         let home = engine.home().to_string();
-        let tray = Tray { hwnd, engine: engine.clone(), dir, home, small, large, hotkey, counts: Counts::default(), latest: latest.clone(), started: Instant::now() };
+        let tray = Tray {
+            hwnd,
+            engine: engine.clone(),
+            dir,
+            home,
+            small,
+            large,
+            hotkey,
+            counts: Counts::default(),
+            latest: latest.clone(),
+            started: Instant::now(),
+        };
         TRAY.with_borrow_mut(|t| *t = Some(tray));
         WINDOW.store(hwnd as isize, Ordering::Relaxed);
         add();

@@ -9,7 +9,7 @@
 //! calls that may block), so typing never waits on either.
 
 use crate::usage::{History, Opened};
-use scry::{Engine, Found, Grep, GrepMode, Query, paths, walk};
+use scry::{Engine, Found, Grep, GrepMode, Order, Query, human_age, human_size, paths, walk};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
@@ -22,8 +22,8 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
-use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::*;
@@ -864,12 +864,21 @@ fn search(engine: &Engine, home: &str, text: &str, opened: &Mutex<Opened>, icons
             Ok(found) => {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                 // Not held while icons are looked up: opening waits on it.
-                let ranked = rerank(found, &opened.lock().unwrap(), now);
+                // Sorted by size or date: what was sorted on leads the line.
+                let ranked = match q.order {
+                    Order::Relevance => rerank(found, &opened.lock().unwrap(), now),
+                    _ => found.into_iter().take(LIMIT).collect(),
+                };
                 Ok(ranked
                     .into_iter()
                     .map(|f| {
                         let dir = f.kind & 3 == walk::KIND_DIR;
-                        Row { name: name_of(&f.path), detail: parent_of(&f.path), icon: icons.of(&f.path, dir), path: Some(f.path) }
+                        let detail = match q.order {
+                            Order::Relevance => parent_of(&f.path),
+                            Order::Size => format!("{}  ·  {}", human_size(f.size), parent_of(&f.path)),
+                            Order::Date => format!("{}  ·  {}", human_age(f.mtime), parent_of(&f.path)),
+                        };
+                        Row { name: name_of(&f.path), detail, icon: icons.of(&f.path, dir), path: Some(f.path) }
                     })
                     .collect())
             }
@@ -959,7 +968,11 @@ mod tests {
             opened.record(Path::new(r"C:\probe\gamma.txt"));
         }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        assert_eq!(names(rerank(found(), &opened, now)), ["exact.txt", "gamma.txt", "alpha.txt", "beta.txt"], "above equals, not above a far better match");
+        assert_eq!(
+            names(rerank(found(), &opened, now)),
+            ["exact.txt", "gamma.txt", "alpha.txt", "beta.txt"],
+            "above equals, not above a far better match"
+        );
         let many: Vec<Found> = (0..300).map(|i| f(&format!("{i}.txt"), 1000 - i)).collect();
         assert_eq!(rerank(many, &opened, now).len(), LIMIT);
         let _ = std::fs::remove_dir_all(&dir);

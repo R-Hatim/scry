@@ -410,3 +410,30 @@ fn a_checkpoint_resumes_where_it_was() {
     let mut other = Live::new(Index::build(listings(&t.ip), 2, now_secs(), roots));
     assert!(!other.restore_checkpoint(&cp), "a checkpoint of another base is refused");
 }
+
+#[test]
+fn folders_add_up_and_sort_by_size() {
+    let t = Tree::new("sizes");
+    t.write(r"big\one.bin", &"x".repeat(100));
+    t.write(r"big\inner\two.bin", &"x".repeat(50));
+    t.write(r"small\three.bin", &"x".repeat(7));
+    let mut live = live_of(&t);
+    let size = |live: &Live, rel: &str| {
+        let e = live.base.lookup(&if rel.is_empty() { t.ip.clone() } else { t.at(rel) }).unwrap();
+        live.dir_sizes()[live.base.dir_of(e).unwrap() as usize]
+    };
+    assert_eq!((size(&live, ""), size(&live, "big"), size(&live, "big/inner"), size(&live, "small")), (157, 150, 50, 7));
+
+    std::fs::remove_file(t.root.join(r"big\inner\two.bin")).unwrap();
+    t.write(r"big\inner\four.bin", &"x".repeat(30));
+    live.apply_dir(&t.at("big/inner"), false);
+    assert_eq!((size(&live, "big"), size(&live, "big/inner")), (130, 30), "gone files leave the sizes, new ones count");
+
+    let name = |p: &String| Path::new(p).file_name().unwrap().to_string_lossy().into_owned();
+    let all: Vec<String> = find(&live, &format!("sort:size in:{}", t.root.display())).iter().map(name).collect();
+    assert_eq!(all[..2], ["big", "one.bin"], "largest first, folders by everything under them: {all:?}");
+    let dirs: Vec<String> = find(&live, &format!("kind:dir sort:size in:{}", t.root.display())).iter().map(name).collect();
+    assert_eq!(dirs, ["big", "inner", "small"]);
+    assert_eq!(Query::parse("sort:newest", r"C:\").unwrap().order, crate::query::Order::Date);
+    assert!(Query::parse("sort:colour", r"C:\").is_err());
+}
