@@ -3,8 +3,8 @@
 Whole-disk file search for Windows: to scry is to see what is hidden. Finds
 any file on your fixed drives by name in about a millisecond, forgives
 typos, and searches inside your text files, Office documents and PDFs
-with an index. Use it from a
-search bar on a hotkey, as a CLI (with a small daemon), or as a Rust crate.
+with an index. Use it from a search bar on a hotkey, as a CLI (with a
+small daemon), or as a Rust crate.
 
 A Windows port of [noahdunnagan/fsearch](https://github.com/noahdunnagan/fsearch),
 which is macOS-only.
@@ -112,8 +112,7 @@ Content search covers the text files and documents in your folders: Word,
 Excel and PowerPoint files and OpenDocument files are read directly (no
 Office needed), PDFs through the PDF filter Windows itself indexes them
 with (scanned PDFs without a text layer have nothing to find). What is in
-them
-ranks first. By default that is your user folder. Choose them, and the
+them ranks first. By default that is your user folder. Choose them, and the
 folders to leave out entirely, in **Folders…** on the tray icon (Scry
 restarts to apply them), or in `%LOCALAPPDATA%\Scry\config.json`, then
 `scry stop` (the next search restarts the daemon):
