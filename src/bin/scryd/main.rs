@@ -12,6 +12,7 @@
 mod bar;
 mod folders;
 mod tray;
+mod usage;
 
 use scry::server;
 use std::path::PathBuf;
@@ -40,7 +41,7 @@ fn main() {
         Some(k) => vec![k],
         None => bar::DEFAULT_HOTKEYS.iter().map(|k| k.to_string()).collect(),
     };
-    let hotkey = match bar::create(engine.clone(), home, &hotkeys) {
+    let hotkey = match bar::create(engine.clone(), home, &dir, &hotkeys) {
         Ok(k) => k,
         Err(e) => return scry::log(e),
     };

@@ -8,7 +8,8 @@
 //! Searches run on a worker thread, which also looks up the icons (shell
 //! calls that may block), so typing never waits on either.
 
-use scry::{Engine, Grep, GrepMode, Query, paths, walk};
+use crate::usage::{History, Opened};
+use scry::{Engine, Found, Grep, GrepMode, Query, paths, walk};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
@@ -20,6 +21,8 @@ use windows_sys::Win32::Graphics::Dwm::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows_sys::Win32::UI::Controls::*;
@@ -159,6 +162,11 @@ struct Ui {
     /// Which query the rows answer.
     seq: u64,
     work: Arc<Work>,
+    /// Your past searches; which one Up brought back (0 the latest) while
+    /// the box still holds it; and that the box is being set to one.
+    history: History,
+    recalled: Option<usize>,
+    recalling: bool,
 }
 
 impl Ui {
@@ -202,6 +210,8 @@ struct Work {
     want: Mutex<Option<(u64, String)>>,
     wake: Condvar,
     done: Mutex<Option<(u64, Vec<Row>)>>,
+    /// What you opened before, which ranks higher.
+    opened: Mutex<Opened>,
 }
 
 /// "Ctrl+Alt+Space", "Win+Shift+F" or "Alt+F1" as RegisterHotKey wants it.
@@ -226,7 +236,7 @@ fn parse_hotkey(s: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
 
 /// Make the bar (hidden) on this thread, and take the first of `hotkeys`
 /// no other program holds: which one, or None. Err if there is no window.
-pub fn create(engine: Engine, home: String, hotkeys: &[String]) -> Result<Option<String>, String> {
+pub fn create(engine: Engine, home: String, dir: &Path, hotkeys: &[String]) -> Result<Option<String>, String> {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CoInitializeEx(null(), COINIT_APARTMENTTHREADED as _);
@@ -292,7 +302,7 @@ pub fn create(engine: Engine, home: String, hotkeys: &[String]) -> Result<Option
         ) as HIMAGELIST;
         let (mut cx, mut cy) = (32, 32);
         ImageList_GetIconSize(images, &mut cx, &mut cy);
-        let work = Arc::new(Work { want: Mutex::new(None), wake: Condvar::new(), done: Mutex::new(None) });
+        let work = Arc::new(Work { want: Mutex::new(None), wake: Condvar::new(), done: Mutex::new(None), opened: Mutex::new(Opened::load(dir)) });
         let mut ui = Ui {
             hwnd,
             edit,
@@ -311,6 +321,9 @@ pub fn create(engine: Engine, home: String, hotkeys: &[String]) -> Result<Option
             anchor: (0, 0),
             seq: 0,
             work: work.clone(),
+            history: History::load(dir),
+            recalled: None,
+            recalling: false,
         };
         let theme = system_theme();
         ui.set_theme(theme);
@@ -367,10 +380,16 @@ fn key(vk: u16) -> bool {
     let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
     match vk {
         VK_DOWN => step(1),
-        VK_UP => step(-1),
+        VK_UP => {
+            if !back_in_history() {
+                step(-1)
+            }
+        }
         VK_NEXT => step(VISIBLE as i32),
         VK_PRIOR => step(-(VISIBLE as i32)),
         VK_RETURN => open(ctrl),
+        // The selected file rather than the query's text (when one is).
+        VK_C if ctrl => return copy(unsafe { GetKeyState(VK_SHIFT as i32) } < 0),
         VK_ESCAPE => hide(),
         // The edit box would type a box character.
         VK_BACK if ctrl => delete_word(),
@@ -396,11 +415,45 @@ fn step(by: i32) {
     unsafe { SendMessageW(list, LB_SETCURSEL, next as WPARAM, 0) };
 }
 
+/// Up in an empty box, or at the top of the list after a past search came
+/// back, brings back the search before it. True if it did.
+fn back_in_history() -> bool {
+    let Some((_, edit, list)) = handles() else { return false };
+    let text = String::from_utf16_lossy(&edit_text(edit));
+    let text = text.trim();
+    let at_top = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) } <= 0;
+    let Some(Some((back, query))) = with(|u| {
+        let back = match u.recalled {
+            Some(i) if at_top => i + 1,
+            Some(_) => return None,
+            None if text.is_empty() => 0,
+            // The bar came back with your last search in the box.
+            None if at_top => (0..).map_while(|i| u.history.get(i)).position(|q| q == text)? + 1,
+            None => return None,
+        };
+        u.history.get(back).map(|q| (back, q.to_string()))
+    }) else {
+        return false;
+    };
+    with(|u| (u.recalled, u.recalling) = (Some(back), true));
+    let w = wide(&query);
+    let end = query.encode_utf16().count();
+    unsafe {
+        // Sends EN_CHANGE: the search runs as if typed.
+        SetWindowTextW(edit, w.as_ptr());
+        SendMessageW(edit, EM_SETSEL, end, end as LPARAM);
+    }
+    with(|u| u.recalling = false);
+    true
+}
+
 /// Open the selected row (or, with `reveal`, show it selected in Explorer).
 fn open(reveal: bool) {
-    let Some((_, _, list)) = handles() else { return };
+    let Some((_, edit, list)) = handles() else { return };
     let sel = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) };
     let Some(path) = with(|u| usize::try_from(sel).ok().and_then(|i| u.rows.get(i)).and_then(|r| r.path.clone())).flatten() else { return };
+    // Remembered: it ranks higher next time, and Up brings the search back.
+    remember(edit, &path);
     hide();
     let verb = wide("open");
     unsafe {
@@ -412,6 +465,75 @@ fn open(reveal: bool) {
             let dir = path.parent().map(|d| wide(&d.display().to_string()));
             ShellExecuteW(null_mut(), verb.as_ptr(), file.as_ptr(), null(), dir.as_ref().map_or(null(), |d| d.as_ptr()), SW_SHOWNORMAL);
         }
+    }
+}
+
+/// A result you opened or copied: it ranks higher next time, and Up brings
+/// the search back.
+fn remember(edit: HWND, path: &Path) {
+    let query = String::from_utf16_lossy(&edit_text(edit));
+    with(|u| {
+        u.history.push(&query);
+        u.work.opened.lock().unwrap().record(path);
+    });
+}
+
+/// Ctrl+C: the selected file to the clipboard, to paste into Explorer, a
+/// mail or a chat. Ctrl+Shift+C: its path in quotes, as Explorer's "Copy as
+/// path". False when no file is selected: the box copies its text then.
+fn copy(as_path: bool) -> bool {
+    let Some((hwnd, edit, list)) = handles() else { return false };
+    let sel = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) };
+    let Some(path) = with(|u| usize::try_from(sel).ok().and_then(|i| u.rows.get(i)).and_then(|r| r.path.clone())).flatten() else { return false };
+    let copied = if as_path {
+        let text: Vec<u8> = format!("\"{}\"", path.display()).encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+        to_clipboard(hwnd, CF_UNICODETEXT, &text)
+    } else {
+        to_clipboard(hwnd, CF_HDROP, &drop_files(&path))
+    };
+    if copied {
+        remember(edit, &path);
+        hide();
+    }
+    true
+}
+
+const CF_UNICODETEXT: u32 = 13;
+const CF_HDROP: u32 = 15;
+
+/// One file as the clipboard's CF_HDROP: a DROPFILES header, then the path
+/// in UTF-16, ended by two NULs.
+fn drop_files(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    let header = size_of::<DROPFILES>();
+    let mut b = vec![0u8; header];
+    b[..4].copy_from_slice(&(header as u32).to_le_bytes());
+    // fWide: the names are UTF-16.
+    b[header - 4..].copy_from_slice(&1u32.to_le_bytes());
+    b.extend(path.as_os_str().encode_wide().chain([0, 0]).flat_map(u16::to_le_bytes));
+    b
+}
+
+/// Put `data` on the clipboard as `format`, replacing what was there.
+fn to_clipboard(owner: HWND, format: u32, data: &[u8]) -> bool {
+    unsafe {
+        if OpenClipboard(owner) == 0 {
+            return false;
+        }
+        EmptyClipboard();
+        let h = GlobalAlloc(GMEM_MOVEABLE, data.len());
+        let p = GlobalLock(h);
+        let ok = !p.is_null() && {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast(), data.len());
+            GlobalUnlock(h);
+            // The clipboard owns the memory from here on.
+            !SetClipboardData(format, h).is_null()
+        };
+        if !ok && !h.is_null() {
+            GlobalFree(h);
+        }
+        CloseClipboard();
+        ok
     }
 }
 
@@ -523,6 +645,12 @@ fn place() {
 /// The query changed: hand it to the worker.
 fn query_changed() {
     let Some((_, edit, list)) = handles() else { return };
+    // Typed into: no longer a past search brought back.
+    with(|u| {
+        if !u.recalling {
+            u.recalled = None;
+        }
+    });
     let text = String::from_utf16_lossy(&edit_text(edit));
     let empty = text.trim().is_empty();
     let Some(work) = with(|u| {
@@ -702,7 +830,7 @@ fn worker(work: &Work, engine: &Engine, home: &str, target: isize) {
                 want = work.wake.wait(want).unwrap();
             }
         };
-        let rows = search(engine, home, &text, &mut icons);
+        let rows = search(engine, home, &text, &work.opened, &mut icons);
         *work.done.lock().unwrap() = Some((seq, rows));
         unsafe { PostMessageW(target as HWND, WM_RESULTS, 0, 0) };
     }
@@ -712,7 +840,7 @@ fn worker(work: &Work, engine: &Engine, home: &str, target: isize) {
 /// trigram, the content index can't narrow anything down.
 const FALLBACK_MIN: usize = 3;
 
-fn search(engine: &Engine, home: &str, text: &str, icons: &mut Icons) -> Vec<Row> {
+fn search(engine: &Engine, home: &str, text: &str, opened: &Mutex<Opened>, icons: &mut Icons) -> Vec<Row> {
     let message = |m: String| vec![Row { path: None, name: m, detail: String::new(), icon: -1 }];
     let mut q = match Query::parse(text, home) {
         Ok(q) => q,
@@ -721,7 +849,7 @@ fn search(engine: &Engine, home: &str, text: &str, icons: &mut Icons) -> Vec<Row
     q.limit = LIMIT;
     let rows = match q.grep.take() {
         Some(pattern) => content(engine, &q, &pattern, q.grep_mode, icons),
-        None => match engine.search(&q) {
+        None => match engine.search(&Query { limit: LIMIT * 4, ..q.clone() }) {
             Ok(found) if found.is_empty() => {
                 // No file is called that: look for it inside files (the
                 // filters still choose which), as if typed with grep:.
@@ -733,13 +861,18 @@ fn search(engine: &Engine, home: &str, text: &str, icons: &mut Icons) -> Vec<Row
                 q.tokens.clear();
                 content(engine, &q, words, GrepMode::Literal, icons)
             }
-            Ok(found) => Ok(found
-                .into_iter()
-                .map(|f| {
-                    let dir = f.kind & 3 == walk::KIND_DIR;
-                    Row { name: name_of(&f.path), detail: parent_of(&f.path), icon: icons.of(&f.path, dir), path: Some(f.path) }
-                })
-                .collect()),
+            Ok(found) => {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                // Not held while icons are looked up: opening waits on it.
+                let ranked = rerank(found, &opened.lock().unwrap(), now);
+                Ok(ranked
+                    .into_iter()
+                    .map(|f| {
+                        let dir = f.kind & 3 == walk::KIND_DIR;
+                        Row { name: name_of(&f.path), detail: parent_of(&f.path), icon: icons.of(&f.path, dir), path: Some(f.path) }
+                    })
+                    .collect())
+            }
             Err(e) => Err(e),
         },
     };
@@ -748,6 +881,14 @@ fn search(engine: &Engine, home: &str, text: &str, icons: &mut Icons) -> Vec<Row
         Ok(rows) => rows,
         Err(e) => message(e),
     }
+}
+
+/// What you opened before ranks higher (`Opened::boost`); the rest keep
+/// their order. The best LIMIT.
+fn rerank(mut found: Vec<Found>, opened: &Opened, now: u64) -> Vec<Found> {
+    found.sort_by_cached_key(|f| std::cmp::Reverse(f.score + opened.boost(&f.path, now)));
+    found.truncate(LIMIT);
+    found
 }
 
 /// Files containing `pattern`, among those `q` picks: a row per file, with
@@ -804,6 +945,35 @@ impl Icons {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opened_files_rank_higher() {
+        let dir = std::env::temp_dir().join(format!("scry-rerank-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut opened = Opened::load(&dir);
+        let f = |name: &str, score| Found { path: Path::new(r"C:\probe").join(name), kind: 0, size: 0, mtime: 0, score };
+        let names = |v: Vec<Found>| v.iter().map(|f| name_of(&f.path)).collect::<Vec<_>>();
+        let found = || vec![f("exact.txt", 400), f("alpha.txt", 100), f("beta.txt", 100), f("gamma.txt", 100)];
+        assert_eq!(names(rerank(found(), &opened, 0)), ["exact.txt", "alpha.txt", "beta.txt", "gamma.txt"]);
+        for _ in 0..5 {
+            opened.record(Path::new(r"C:\probe\gamma.txt"));
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(names(rerank(found(), &opened, now)), ["exact.txt", "gamma.txt", "alpha.txt", "beta.txt"], "above equals, not above a far better match");
+        let many: Vec<Found> = (0..300).map(|i| f(&format!("{i}.txt"), 1000 - i)).collect();
+        assert_eq!(rerank(many, &opened, now).len(), LIMIT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_for_the_clipboard() {
+        let b = drop_files(Path::new(r"C:\Docs\é.pdf"));
+        assert_eq!(&b[..4], &20u32.to_le_bytes(), "the names start after the 20-byte header");
+        assert_eq!(&b[16..20], &1u32.to_le_bytes(), "in UTF-16");
+        let names: Vec<u16> = b[20..].as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
+        let want: Vec<u16> = r"C:\Docs\é.pdf".encode_utf16().chain([0, 0]).collect();
+        assert_eq!(names, want, "one name, then the empty one that ends the list");
+    }
 
     #[test]
     fn hotkeys_parse() {
