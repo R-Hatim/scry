@@ -9,3 +9,5 @@ Download **scry-…-setup-x64.exe** below and run it. No administrator rights ne
 The **zip** holds the two programs without an installer: unzip anywhere and run `scry install --login` to start it at sign-in.
 
 The tray icon shows the index status; right-click it to choose the folders Scry searches inside of and the ones it leaves out.
+
+[Code signing policy](https://github.com/R-Hatim/scry#code-signing-policy): free code signing provided by SignPath.io, certificate by SignPath Foundation (applied for; until it is granted, the builds are unsigned).

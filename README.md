@@ -18,9 +18,10 @@ the `scry` command on your PATH; both can be unticked. The first run
 indexes your drives (about a minute) and a notification says when it is
 ready. Uninstall from Settings > Apps.
 
-The builds are not code-signed yet, so Windows may say it protected your
-PC: **More info**, then **Run anyway**. `SHA256SUMS.txt` in each release
-has the checksums.
+The builds are not code-signed yet (see the
+[code signing policy](#code-signing-policy)), so Windows may say it
+protected your PC: **More info**, then **Run anyway**. `SHA256SUMS.txt` in
+each release has the checksums.
 
 From source:
 
@@ -153,6 +154,30 @@ others follow along.
   range. Each distinct name is scored once.
 - Content search uses a trigram index of your text files. Matches are read
   fresh from disk, so they're never stale.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/),
+certificate by [SignPath Foundation](https://signpath.org/). (Applied for;
+v0.1.0 is not signed.)
+
+Releases are built from this repository by GitHub Actions
+([release.yml](.github/workflows/release.yml)) from a version tag; nothing
+released is built on a personal machine.
+
+- Committers and reviewers: [Hatim Rih](https://github.com/R-Hatim)
+- Approvers: [Hatim Rih](https://github.com/R-Hatim)
+
+Changes from anyone else come in as pull requests, reviewed by a committer
+before they are merged. Every signing request is approved by hand.
+
+## Privacy
+
+Scry does not transfer any information to other networked systems unless
+specifically requested by the user or the person installing or operating
+it. The index and settings stay on your PC, in `%LOCALAPPDATA%\Scry`, and
+the daemon answers the `scry` command over a local named pipe that only
+your account can open.
 
 ## Building
 
