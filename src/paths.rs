@@ -1,4 +1,4 @@
-//! Paths inside fsearch are bytes: WTF-8 (what Windows names decode to,
+//! Paths inside scry are bytes: WTF-8 (what Windows names decode to,
 //! unpaired surrogates included), '/'-separated, under a virtual root "/"
 //! whose children are the drives. `C:\Users\me\a.txt` is `/C:/Users/me/a.txt`
 //! here and `C:\` is `/C:`. Everything that splits, joins and compares paths

@@ -1,18 +1,34 @@
-# FSearch
+# Scry
 
-Whole-disk file search for Windows. Finds any file on your fixed drives by
-name in about a millisecond, forgives typos, and searches inside your text
-files with an index. Use it as a CLI (with a small daemon) or as a Rust
-crate.
+Whole-disk file search for Windows: to scry is to see what is hidden. Finds
+any file on your fixed drives by name in about a millisecond, forgives
+typos, and searches inside your text files with an index. Use it from a
+search bar on a hotkey, as a CLI (with a small daemon), or as a Rust crate.
 
 A Windows port of [noahdunnagan/fsearch](https://github.com/noahdunnagan/fsearch),
 which is macOS-only.
 
+## Install
+
+Download `scry-<version>-setup-x64.exe` from the
+[latest release](https://github.com/R-Hatim/scry/releases/latest) and run
+it. It needs no administrator rights: it installs for you only
+(`%LOCALAPPDATA%\Programs\Scry`), starts Scry when you sign in and puts
+the `scry` command on your PATH; both can be unticked. The first run
+indexes your drives (about a minute) and a notification says when it is
+ready. Uninstall from Settings > Apps.
+
+The builds are not code-signed yet, so Windows may say it protected your
+PC: **More info**, then **Run anyway**. `SHA256SUMS.txt` in each release
+has the checksums.
+
+From source:
+
 ```
 cargo build --release
-target\release\fsearch install --login  # -> %USERPROFILE%\.local\bin, started at login
-fsearch fsearch main                    # find files by name
-fsearch "ext:rs grep:apply_dir"         # search inside files
+target\release\scry install --login   # -> %USERPROFILE%\.local\bin, started at login
+scry scry main                        # find files by name
+scry "ext:rs grep:apply_dir"          # search inside files
 ```
 
 ## Search bar
@@ -25,11 +41,20 @@ the bar away. The whole query language works in it (`ext:pdf invoice`,
 the words inside your files instead (filters still apply: `ext:cs
 SendInvoiceMail`).
 
-The bar lives in the daemon, `fsearchd.exe`: it is there whenever the
+The bar lives in the daemon, `scryd.exe`: it is there whenever the
 daemon runs (at login with `install --login`, or from the first search).
 Another key: `"hotkey": "Win+Shift+F"` in `config.json`. Without one, the
 first free of Alt+Shift+Space, Win+Shift+F and Ctrl+Alt+F is used;
 `daemon.log` says which.
+
+## Tray icon
+
+The daemon has an icon in the notification area. Its tooltip says how far
+the index is: indexing, how many files and folders it holds, how many text
+files are still being read for content search. A click brings up the bar.
+The right-click menu shows the same counts and has **Folders…** (see
+below), **Start at login** (the same login item as `install --login`) and
+**Quit**. After the very first crawl, a notification says when it is ready.
 
 ## Speed
 
@@ -47,11 +72,11 @@ i7-11850H laptop, NVMe, Defender on, 5.0M files and folders on C:.
 ## Queries
 
 ```
-fsearch "readme in:C:\Workspace"         # inside a folder
-fsearch "type:image size:>5mb mtime:<7d"
-fsearch "type:app code"                  # programs and Start Menu shortcuts
-fsearch "ext:rs regex:fn\s+\w+_dir"      # regex inside files
-fsearch "sym:apply_dir"                  # where it's defined
+scry "readme in:C:\Workspace"         # inside a folder
+scry "type:image size:>5mb mtime:<7d"
+scry "type:app code"                  # programs and Start Menu shortcuts
+scry "ext:rs regex:fn\s+\w+_dir"      # regex inside files
+scry "sym:apply_dir"                  # where it's defined
 ```
 
 Words are fuzzy, and 5+ letter words forgive one typo (`mian.rs` finds
@@ -64,34 +89,37 @@ see `C:/Users/...`, with forward slashes. Content search is smart-case.
 ## Your folders
 
 Content search covers the text files in your folders, and what is in them
-ranks first. By default that is your user folder; add your own in
-`%LOCALAPPDATA%\FSearch\config.json`, then `fsearch stop` (the next search
-restarts the daemon):
+ranks first. By default that is your user folder. Choose them, and the
+folders to leave out entirely, in **Folders…** on the tray icon (Scry
+restarts to apply them), or in `%LOCALAPPDATA%\Scry\config.json`, then
+`scry stop` (the next search restarts the daemon):
 
 ```json
 {"roots": ["~", "C:\\Workspace"], "skip": ["D:\\Backups"], "hotkey": "Alt+Shift+Space"}
 ```
 
-`skip` lists folders never to open. Folders outside your roots are still
-searched by name, and `grep:` with an `in:` there reads the files directly.
+`skip` lists folders never to open: what is in them is not found, by name
+or by content. Folders outside your roots are still searched by name, and
+`grep:` with an `in:` there reads the files directly.
 Build output, dependencies and app data (`node_modules`, `.git`, `obj`,
 `AppData`, ...) are left out of the content index, and OneDrive files that
 are online-only are never downloaded by a search.
 
 ## Login item and elevation
 
-`fsearch install --login` also starts the daemon at login (a `Run` entry
-for `fsearchd.exe`, which has no console window, only the search bar);
-`fsearch uninstall` removes it, `fsearch stop` ends the running one. The daemon indexes what your account can read. Run it elevated
-and it turns on the backup privilege and indexes everything; set
-`FSEARCH_RESTRICT=1` to keep it to what you can read anyway.
+`scry install --login` also starts the daemon at login (a `Run` entry
+for `scryd.exe`, which has no console window, only the search bar and
+the tray icon); `scry uninstall` removes it, `scry stop` ends the
+running one. The daemon indexes what your account can read. Run it
+elevated and it turns on the backup privilege and indexes everything; set
+`SCRY_RESTRICT=1` to keep it to what you can read anyway.
 
 ## API
 
-JSON lines over a named pipe (`fsearch::server::pipe_name`), or `fsearch stdio`:
+JSON lines over a named pipe (`scry::server::pipe_name`), or `scry stdio`:
 
 ```json
-{"q": "fsearch main", "limit": 20}
+{"q": "scry main", "limit": 20}
 {"op": "grep", "pattern": "apply_dir", "in": "~\\Developer"}
 {"op": "status"}
 ```
@@ -99,10 +127,10 @@ JSON lines over a named pipe (`fsearch::server::pipe_name`), or `fsearch stdio`:
 Or link the crate:
 
 ```rust
-let home = fsearch::default_home();
-let opts = fsearch::server::options(&fsearch::default_dir(&home), &home);
-let engine = fsearch::Engine::start(opts)?;
-let hits = engine.search(&fsearch::Query::parse("fsearch main", &home)?)?;
+let home = scry::default_home();
+let opts = scry::server::options(&scry::default_dir(&home), &home);
+let engine = scry::Engine::start(opts)?;
+let hits = engine.search(&scry::Query::parse("scry main", &home)?)?;
 ```
 
 An app and the CLI share one index: the first process owns it and the
@@ -129,4 +157,11 @@ others follow along.
 ## Building
 
 Rust 1.89+ with the MSVC toolchain, Windows 10 1809 or later. `cargo test`
-runs against throwaway folders in `%TEMP%`.
+runs against throwaway folders in `%TEMP%`. The icon is `assets\scry.ico`,
+drawn by `assets\icon.ps1`; `build.rs` embeds it and the version (from
+`Cargo.toml`) in both programs, without a resource compiler.
+
+`installer\scry.iss` is the Inno Setup script for the installer (`iscc
+/DAppVersion=0.1.0 installer\scry.iss` after a release build). A tag like
+`v0.1.0`, matching `Cargo.toml`, makes GitHub Actions build the installer
+and a zip and attach them to a draft release.

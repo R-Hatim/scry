@@ -724,6 +724,23 @@ impl Content {
         self.segs.iter().map(|s| s.map.len()).sum()
     }
 
+    /// Tombstone the docs outside `roots`: what was read from a folder that
+    /// is no longer one of yours. How many went.
+    pub fn forget_outside(&mut self, roots: &[Vec<u8>]) -> usize {
+        let mut n = 0;
+        for s in self.segs.iter_mut() {
+            let gone: Vec<u32> = (0..s.ndocs as u32).filter(|&d| !s.is_dead(d) && !in_scope(s.path(d), roots)).collect();
+            for &d in &gone {
+                s.kill(d);
+            }
+            if !gone.is_empty() {
+                s.save_dead(&self.dir);
+            }
+            n += gone.len();
+        }
+        n
+    }
+
     /// Diff what the name index wants (from `wanted`, per dir) against the
     /// docs we hold: tombstone what changed or went away, return what needs
     /// (re)indexing. Cheap; the caller builds segments off-lock.
@@ -976,7 +993,7 @@ fn read_pool() -> &'static rayon::ThreadPool {
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(4)
-            .thread_name(|i| format!("fsearch-read-{i}"))
+            .thread_name(|i| format!("scry-read-{i}"))
             // Someone is waiting on these reads.
             .start_handler(|_| crate::sys::interactive_thread())
             .build()

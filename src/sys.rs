@@ -20,7 +20,7 @@ use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle};
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Pipes::*;
-use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW};
+use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW};
 use windows_sys::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::System::WindowsProgramming::DRIVE_FIXED;
@@ -387,6 +387,13 @@ pub fn login_item(name: &str, command: Option<&str>) -> bool {
     }
 }
 
+/// Whether something is started at login as `name`.
+pub fn has_login_item(name: &str) -> bool {
+    let (key, val) = (wide(RUN_KEY), wide(name));
+    let mut size = 0u32;
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), val.as_ptr(), RRF_RT_REG_SZ, null_mut(), null_mut(), &mut size) == 0 }
+}
+
 /// Send this process's stderr (where the engine logs) to `f`.
 pub fn set_stderr(f: std::fs::File) {
     unsafe { SetStdHandle(STD_ERROR_HANDLE, f.into_raw_handle()) };
@@ -394,7 +401,7 @@ pub fn set_stderr(f: std::fs::File) {
 
 /// Keep this process's own stdin/stdout/stderr out of programs it starts.
 /// A child inherits every inheritable handle, so a daemon started from
-/// `fsearch status | more` would hold the pipe open and `more` would never
+/// `scry status | more` would hold the pipe open and `more` would never
 /// see its end.
 pub fn keep_std_handles() {
     for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {

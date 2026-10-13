@@ -154,6 +154,28 @@ impl Live {
         self.drop_over_subtree(path);
     }
 
+    /// Drop what is indexed under `path` but keep the folder itself, as a
+    /// crawl leaves a folder it must not open: for one that is skipped now
+    /// (`Options::skip`) but was indexed before. How many entries went.
+    pub fn forget(&mut self, path: &[u8]) -> usize {
+        let dead = self.dead_count;
+        if let Some(d) = self.base_alive(path).and_then(|e| self.base.dir_of(e)) {
+            let (a, b) = (self.base.dir_start()[d as usize], self.base.dir_end()[d as usize]);
+            for i in a..b {
+                self.kill(i);
+            }
+        }
+        let (lo, hi) = subtree_bounds(path);
+        let keys: Vec<Vec<u8>> = self.over.range(lo..hi).map(|(k, _)| k.clone()).collect();
+        for k in &keys {
+            self.over.remove(k);
+        }
+        if self.dead_count > dead || !keys.is_empty() {
+            self.trees.push(path.to_vec());
+        }
+        self.dead_count - dead + keys.len()
+    }
+
     /// Bring one directory (or, with `recursive`, its whole subtree) in line
     /// with the disk.
     pub fn apply_dir(&mut self, path: &[u8], recursive: bool) -> Applied {

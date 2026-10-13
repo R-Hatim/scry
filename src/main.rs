@@ -1,28 +1,28 @@
-//! The `fsearch` command: searches through the daemon (starting it when
+//! The `scry` command: searches through the daemon (starting it when
 //! needed), runs it, installs it.
 
-use fsearch::{index, live, query, server};
+use scry::{index, live, query, server};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = r"usage:
-  fsearch <query...> [--json]   search (starts the daemon if needed)
-  fsearch stdio                 JSON lines on stdin/stdout
-  fsearch serve                 run the daemon in the foreground
-  fsearch status
-  fsearch stop                  stop the daemon (the next search starts it again)
-  fsearch install [--login]     copy to ~\.local\bin; --login also starts the daemon at login
-  fsearch uninstall             remove the login item and stop the daemon (keeps the index)
-  fsearch bench <query...>      time a query in-process against the saved index";
+  scry <query...> [--json]   search (starts the daemon if needed)
+  scry stdio                 JSON lines on stdin/stdout
+  scry serve                 run the daemon in the foreground
+  scry status
+  scry stop                  stop the daemon (the next search starts it again)
+  scry install [--login]     copy to ~\.local\bin; --login also starts the daemon at login
+  scry uninstall             remove the login item and stop the daemon (keeps the index)
+  scry bench <query...>      time a query in-process against the saved index";
 
 fn home() -> String {
-    fsearch::default_home()
+    scry::default_home()
 }
 
 fn data_dir() -> PathBuf {
-    let d = fsearch::default_dir(&home());
+    let d = scry::default_dir(&home());
     std::fs::create_dir_all(&d).ok();
     d
 }
@@ -95,7 +95,7 @@ fn stdio() {
 }
 
 fn bench(qs: &str) {
-    let idx = index::Index::load(&data_dir().join("index.bin")).unwrap_or_else(|| die("no index yet; run fsearch serve"));
+    let idx = index::Index::load(&data_dir().join("index.bin")).unwrap_or_else(|| die("no index yet; run scry serve"));
     let live = live::Live::new(idx);
     let q = query::Query::parse(qs, &home()).unwrap_or_else(|e| die(&e));
     let s = query::Searcher { live: &live };
@@ -109,7 +109,7 @@ fn bench(qs: &str) {
     let mut p = Vec::new();
     for h in hits.iter().take(10) {
         live.base.path(h.idx as usize, &mut p);
-        println!("{:5} {}", h.score, fsearch::paths::display(&p));
+        println!("{:5} {}", h.score, scry::paths::display(&p));
     }
     let first = times[0];
     times.sort();
@@ -145,7 +145,7 @@ fn install(login: bool) {
     let exe = std::env::current_exe().unwrap();
     // The next search starts the new daemon.
     stop(false);
-    for name in ["fsearch.exe", "fsearchd.exe"] {
+    for name in ["scry.exe", "scryd.exe"] {
         let (src, dst) = (exe.with_file_name(name), bin.join(name));
         if !src.is_file() || src == dst {
             continue;
@@ -159,19 +159,19 @@ fn install(login: bool) {
         std::fs::copy(&src, &dst).unwrap_or_else(|e| die(&format!("copy {name}: {e}")));
         let _ = std::fs::remove_file(&old);
     }
-    let daemon = bin.join("fsearchd.exe");
+    let daemon = bin.join("scryd.exe");
     if login {
         if !daemon.is_file() || !server::login_item(Some(&daemon)) {
             die("could not add the login item");
         }
-        server::start_daemon(&data_dir(), &bin.join("fsearch.exe")).unwrap_or_else(|e| die(&format!("start the daemon: {e}")));
+        server::start_daemon(&data_dir(), &bin.join("scry.exe"), &[]).unwrap_or_else(|e| die(&format!("start the daemon: {e}")));
         println!("installed {} (starts at login, running now)", bin.display());
     } else {
         println!("installed {}; the daemon starts on first use", bin.display());
     }
     let on_path = std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == bin));
     if !on_path {
-        println!("add {} to your PATH to run fsearch from anywhere", bin.display());
+        println!("add {} to your PATH to run scry from anywhere", bin.display());
     }
 }
 
@@ -182,6 +182,6 @@ fn uninstall() {
 }
 
 fn die(msg: &str) -> ! {
-    eprintln!("fsearch: {msg}");
+    eprintln!("scry: {msg}");
     std::process::exit(1)
 }

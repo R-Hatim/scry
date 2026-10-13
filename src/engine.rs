@@ -116,11 +116,11 @@ pub fn log(msg: impl AsRef<str>) {
 }
 
 /// Whether this process indexes past folder permissions: true when it runs
-/// elevated (SeBackupPrivilege could be turned on), unless FSEARCH_RESTRICT
+/// elevated (SeBackupPrivilege could be turned on), unless SCRY_RESTRICT
 /// is set.
 pub fn elevated() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FSEARCH_RESTRICT").is_none() && sys::enable_backup_privilege())
+    *ON.get_or_init(|| std::env::var_os("SCRY_RESTRICT").is_none() && sys::enable_backup_privilege())
 }
 
 /// Searches run here, opted out of EcoQoS: a windowless process's threads
@@ -128,7 +128,7 @@ pub fn elevated() -> bool {
 fn search_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new().thread_name(|i| format!("fsearch-search-{i}")).start_handler(|_| sys::interactive_thread()).build().unwrap()
+        rayon::ThreadPoolBuilder::new().thread_name(|i| format!("scry-search-{i}")).start_handler(|_| sys::interactive_thread()).build().unwrap()
     })
 }
 
@@ -192,7 +192,7 @@ impl Engine {
             shared.watch(since);
         }
         let s = shared.clone();
-        spawn("fsearch-apply", move || {
+        spawn("scry-apply", move || {
             let base = match base {
                 Some(b) => {
                     log(format!("loaded {} entries, catching up on changes since {}", b.n, b.synced_at));
@@ -211,6 +211,7 @@ impl Engine {
             };
             *s.live.write().unwrap() = Some(Live::new(base));
             if owner {
+                forget_skipped(&s);
                 start_content(&s);
             }
             apply_loop(&s, rx);
@@ -292,6 +293,32 @@ impl Engine {
         self.s.save_requested.store(true, Ordering::Relaxed);
         let _ = self.s.wake.send(Vec::new());
     }
+
+    /// Bring these folders' whole subtrees in line with the disk soon (on
+    /// the background thread): folders that were skipped and are not any
+    /// more, whose contents the index never saw.
+    pub fn rescan(&self, dirs: &[PathBuf]) {
+        let id = watch::current_event_id();
+        let events: Vec<watch::Event> =
+            dirs.iter().filter_map(|d| paths::from_native(d)).map(|path| watch::Event { path, flags: MUST_SCAN_SUBDIRS, id }).collect();
+        if !events.is_empty() {
+            let _ = self.s.wake.send(events);
+        }
+    }
+}
+
+/// Folders skipped now that were indexed before (`skip` grew since the
+/// last crawl): what is under them goes.
+fn forget_skipped(s: &Shared) {
+    let Some(skip) = walk::SKIP.get() else { return };
+    let n: usize = {
+        let mut g = s.live.write().unwrap();
+        let live = g.as_mut().unwrap();
+        skip.iter().map(|p| live.forget(p)).sum()
+    };
+    if n > 0 {
+        log(format!("left out {n} entries under skipped folders"));
+    }
 }
 
 const INDEXING: &str = "indexing (the first run lists every fixed drive, about a minute)";
@@ -334,11 +361,16 @@ impl Shared {
 
 fn start_content(s: &Arc<Shared>) {
     let Some(rx) = s.content_rx.lock().unwrap().take() else { return };
+    // A folder that is no longer one of yours: what was read from it goes.
+    let gone = s.content.write().unwrap().forget_outside(&s.roots);
+    if gone > 0 {
+        log(format!("content: dropped {gone} files no longer in your folders"));
+    }
     // Reconcile your folders once (cheap when nothing changed), then follow
     // along with the name index's changes.
     let _ = s.content_tx.send((Vec::new(), s.roots.clone()));
     let s = s.clone();
-    spawn("fsearch-content", move || content_loop(&s, rx));
+    spawn("scry-content", move || content_loop(&s, rx));
 }
 
 /// A follower takes over the index files once their owner is gone.
@@ -653,7 +685,7 @@ pub fn default_home() -> String {
     paths::from_user(&h, &h).map_or(h, |p| paths::display(&p))
 }
 
-/// Default data dir: `%LOCALAPPDATA%\FSearch`.
+/// Default data dir: `%LOCALAPPDATA%\Scry`.
 pub fn default_dir(home: &str) -> PathBuf {
-    std::env::var_os("LOCALAPPDATA").map_or_else(|| Path::new(home).join(r"AppData\Local"), PathBuf::from).join("FSearch")
+    std::env::var_os("LOCALAPPDATA").map_or_else(|| Path::new(home).join(r"AppData\Local"), PathBuf::from).join("Scry")
 }

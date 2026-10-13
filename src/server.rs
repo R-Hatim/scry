@@ -1,5 +1,5 @@
 //! The daemon: one `Engine`, answering JSON lines over a named pipe.
-//! `fsearch stdio` and the CLI are thin clients; so can any app be.
+//! `scry stdio` and the CLI are thin clients; so can any app be.
 
 use crate::engine::log;
 use crate::walk::{KIND_DIR, KIND_FILE, KIND_LINK};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 /// The daemon's pipe for an index dir: one per user and index.
 pub fn pipe_name(dir: &Path) -> String {
     let h = dir.to_string_lossy().to_lowercase().bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
-    format!(r"\\.\pipe\fsearch-{h:016x}")
+    format!(r"\\.\pipe\scry-{h:016x}")
 }
 
 /// `config.json` in the index dir, all optional:
@@ -24,7 +24,7 @@ pub struct Config {
     pub roots: Vec<String>,
     /// Folders never to open.
     pub skip: Vec<String>,
-    /// What brings up the search bar (`fsearchd`).
+    /// What brings up the search bar (`scryd`).
     pub hotkey: Option<String>,
 }
 
@@ -72,10 +72,23 @@ pub fn options(dir: &Path, home: &str) -> Options {
     }
 }
 
-/// Start `daemon` (the windowless `fsearchd.exe`) at login, or stop doing
+/// Start `daemon` (the windowless `scryd.exe`) at login, or stop doing
 /// so (None).
 pub fn login_item(daemon: Option<&Path>) -> bool {
-    sys::login_item("fsearch", daemon.map(|d| format!("\"{}\"", d.display())).as_deref())
+    sys::login_item("scry", daemon.map(|d| format!("\"{}\"", d.display())).as_deref())
+}
+
+/// Whether the daemon starts at login.
+pub fn has_login_item() -> bool {
+    sys::has_login_item("scry")
+}
+
+static ON_QUIT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Call `f` just before the daemon exits because a client asked it to
+/// (`scry stop`): to take its icon out of the notification area, say.
+pub fn on_quit(f: fn()) {
+    let _ = ON_QUIT.set(f);
 }
 
 /// Log (stderr) to `f` from now on: a process without a console has none.
@@ -95,21 +108,58 @@ pub fn open_log(dir: &Path) -> std::io::Result<std::fs::File> {
 
 /// Become the daemon for an index dir: one per index. Holding the returned
 /// lock is being it; the lock dies with the process. None if another
-/// daemon runs. (The engine's own lock decides who writes the index: an app
-/// embedding fsearch may own it while the daemon follows.)
-pub fn claim(dir: &Path) -> Option<std::fs::File> {
+/// daemon still runs after `wait` (one restarting itself takes a moment to
+/// leave). (The engine's own lock decides who writes the index: an app
+/// embedding scry may own it while the daemon follows.)
+pub fn claim(dir: &Path, wait: Duration) -> Option<std::fs::File> {
     std::fs::create_dir_all(dir).ok();
     let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(dir.join("socket.lock")).ok()?;
-    if lock.try_lock().is_err() {
-        log("another fsearch daemon is running");
-        return None;
+    let t = Instant::now();
+    while lock.try_lock().is_err() {
+        if t.elapsed() >= wait {
+            log("another scry daemon is running");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
     Some(lock)
 }
 
+/// Your folders and the skipped ones as the engine takes them from
+/// config.json: paths on disk, your user folder when no folder is listed.
+pub fn folders(dir: &Path, home: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let o = options(dir, home);
+    let roots = if o.roots.is_empty() { vec![PathBuf::from(home)] } else { o.roots };
+    (roots, o.skip)
+}
+
+/// Write `roots` and `skip` into config.json, keeping its other settings
+/// (your user folder as `~`). The daemon reads them when it next starts.
+/// Refuses to replace a config.json it cannot read rather than lose it.
+pub fn save_folders(dir: &Path, home: &str, roots: &[PathBuf], skip: &[PathBuf]) -> Result<(), String> {
+    let path = dir.join("config.json");
+    let mut v: Value = match std::fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Ok(b) => decode(&b)
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .filter(Value::is_object)
+            .ok_or_else(|| format!("{} is not a JSON object; fix or delete it first", path.display()))?,
+    };
+    let list = |ps: &[PathBuf]| -> Value {
+        ps.iter().map(|p| if p == Path::new(home) { "~".to_string() } else { p.display().to_string() }).collect::<Vec<_>>().into()
+    };
+    v["roots"] = list(roots);
+    v["skip"] = list(skip);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&v).unwrap() + "\n")
+        .and_then(|_| std::fs::rename(&tmp, &path))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// The daemon: claim the index dir, start an engine, answer on its pipe.
 pub fn serve(dir: PathBuf, home: String) {
-    let Some(_lock) = claim(&dir) else { return };
+    let Some(_lock) = claim(&dir, Duration::ZERO) else { return };
     match Engine::start(options(&dir, &home)) {
         Ok(engine) => listen(&dir, &engine),
         Err(e) => log(e),
@@ -162,6 +212,9 @@ fn handle(conn: std::fs::File, engine: &Engine) {
         }
         if resp["quitting"] == true {
             log("asked to quit");
+            if let Some(f) = ON_QUIT.get() {
+                f();
+            }
             std::process::exit(0);
         }
     }
@@ -192,7 +245,7 @@ fn run(v: &Value, engine: &Engine) -> Result<Value, String> {
             engine.save();
             Ok(json!({"ok": true, "scheduled": true}))
         }
-        // The process exits once this answer is written (`fsearch install`
+        // The process exits once this answer is written (`scry install`
         // replacing the binary, say). The index is crash-safe: every file is
         // written aside and renamed into place.
         "quit" => Ok(json!({"ok": true, "quitting": true})),
@@ -318,7 +371,7 @@ pub fn connect(dir: &Path) -> std::io::Result<std::fs::File> {
         }
         Err(_) => {}
     }
-    start_daemon(dir, &std::env::current_exe()?)?;
+    start_daemon(dir, &std::env::current_exe()?, &[])?;
     for _ in 0..100 {
         std::thread::sleep(Duration::from_millis(30));
         if let Ok(s) = sys::pipe_connect(&name) {
@@ -328,17 +381,19 @@ pub fn connect(dir: &Path) -> std::io::Result<std::fs::File> {
     sys::pipe_connect(&name)
 }
 
-/// Start the daemon in the background: the windowless `fsearchd.exe` next
-/// to `exe` if there is one, else `exe serve`. Detached: no console, its
+/// Start the daemon in the background: the windowless `scryd.exe` next
+/// to `exe` (with `args`) if there is one, else `exe serve`. Detached: no console, its
 /// own process group and, where allowed, out of this terminal's job, so
 /// closing the terminal doesn't take it down.
-pub fn start_daemon(dir: &Path, exe: &Path) -> std::io::Result<()> {
+pub fn start_daemon(dir: &Path, exe: &Path, args: &[std::ffi::OsString]) -> std::io::Result<()> {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
-    let daemon = exe.with_file_name("fsearchd.exe");
+    let daemon = exe.with_file_name("scryd.exe");
     let mut cmd = std::process::Command::new(if daemon.is_file() { &daemon } else { exe });
     if !daemon.is_file() {
         cmd.arg("serve");
+    } else {
+        cmd.args(args);
     }
     let log = open_log(dir)?;
     cmd.stdin(std::process::Stdio::null()).stdout(log.try_clone()?).stderr(log);

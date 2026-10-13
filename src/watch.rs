@@ -90,7 +90,7 @@ pub fn watch(since: u64, latency: f64, tx: Sender<Vec<Event>>) -> Stream {
             // A drive that doesn't open now is retried by its thread.
             let w = Arc::new(Watch(Mutex::new((false, sys::open_dir(&root, true)))));
             let (me, tx) = (w.clone(), tx.clone());
-            std::thread::Builder::new().name(format!("fsearch-watch-{}", d as char)).spawn(move || run(&me, &root, latency, &tx)).ok()?;
+            std::thread::Builder::new().name(format!("scry-watch-{}", d as char)).spawn(move || run(&me, &root, latency, &tx)).ok()?;
             Some(w)
         })
         .collect();

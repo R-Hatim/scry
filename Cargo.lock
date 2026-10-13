@@ -43,20 +43,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
-name = "fsearch"
-version = "0.1.0"
-dependencies = [
- "memchr",
- "memmap2",
- "rayon",
- "regex",
- "regex-syntax",
- "serde",
- "serde_json",
- "windows-sys",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -149,6 +135,20 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "scry"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "memmap2",
+ "rayon",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "windows-sys",
+]
 
 [[package]]
 name = "serde"

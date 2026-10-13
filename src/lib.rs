@@ -2,7 +2,7 @@
 //! on every fixed drive, kept live from change notifications, plus a
 //! trigram content index for the text files in your folders. `Engine` runs
 //! it all in-process; `server` wraps one in a daemon answering JSON lines on
-//! a named pipe, which the `fsearch` command talks to.
+//! a named pipe, which the `scry` command talks to.
 
 pub mod content;
 mod engine;

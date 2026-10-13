@@ -1,5 +1,5 @@
 //! The search bar: a hotkey (Alt+Shift+Space, or `hotkey` in config.json)
-//! brings up a box in the middle of the screen. Results come as you type;
+//! or a click on the tray icon brings up a box in the middle of the screen. Results come as you type;
 //! Up/Down picks one, Enter opens it, Ctrl+Enter shows it in Explorer, Esc
 //! or a click elsewhere puts the bar away. The whole query language works
 //! (`ext:pdf invoice`, `in:~\Documents report`, `grep:TODO`), and when no
@@ -8,7 +8,7 @@
 //! Searches run on a worker thread, which also looks up the icons (shell
 //! calls that may block), so typing never waits on either.
 
-use fsearch::{Engine, Grep, GrepMode, Query, paths, walk};
+use scry::{Engine, Grep, GrepMode, Query, paths, walk};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
@@ -224,13 +224,14 @@ fn parse_hotkey(s: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
     Some((mods, vk?))
 }
 
-/// Run the bar on this thread, answering the first of `hotkeys` it gets.
-pub fn run(engine: Engine, home: String, hotkeys: &[String]) {
+/// Make the bar (hidden) on this thread, and take the first of `hotkeys`
+/// no other program holds: which one, or None. Err if there is no window.
+pub fn create(engine: Engine, home: String, hotkeys: &[String]) -> Result<Option<String>, String> {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CoInitializeEx(null(), COINIT_APARTMENTTHREADED as _);
         let inst = GetModuleHandleW(null());
-        let class = wide("fsearch-bar");
+        let class = wide("scry-bar");
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: CS_DROPSHADOW,
@@ -245,7 +246,7 @@ pub fn run(engine: Engine, home: String, hotkeys: &[String]) {
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             class.as_ptr(),
-            wide("fsearch").as_ptr(),
+            wide("Scry").as_ptr(),
             WS_POPUP,
             0,
             0,
@@ -257,7 +258,7 @@ pub fn run(engine: Engine, home: String, hotkeys: &[String]) {
             null(),
         );
         if hwnd.is_null() {
-            return fsearch::log(format!("search bar: no window ({})", std::io::Error::last_os_error()));
+            return Err(format!("search bar: no window ({})", std::io::Error::last_os_error()));
         }
         let edit = CreateWindowExW(
             0,
@@ -321,24 +322,38 @@ pub fn run(engine: Engine, home: String, hotkeys: &[String]) {
         let got = hotkeys.iter().find(|k| match parse_hotkey(k) {
             Some((mods, vk)) if RegisterHotKey(hwnd, 1, mods | MOD_NOREPEAT, vk) != 0 => true,
             Some(_) => {
-                fsearch::log(format!("search bar: cannot have {k} ({})", std::io::Error::last_os_error()));
+                scry::log(format!("search bar: cannot have {k} ({})", std::io::Error::last_os_error()));
                 false
             }
             None => {
-                fsearch::log(format!("search bar: cannot read the hotkey {k:?} (like \"Alt+Shift+Space\")"));
+                scry::log(format!("search bar: cannot read the hotkey {k:?} (like \"Alt+Shift+Space\")"));
                 false
             }
         });
         match got {
-            Some(k) => fsearch::log(format!("search bar on {k}")),
-            None => fsearch::log("search bar: no hotkey; set a free one as \"hotkey\" in config.json"),
+            Some(k) => scry::log(format!("search bar on {k}")),
+            None => scry::log("search bar: no hotkey; set a free one as \"hotkey\" in config.json"),
         }
         let target = hwnd as isize;
-        std::thread::Builder::new().name("fsearch-bar-search".into()).spawn(move || worker(&work, &engine, &home, target)).expect("spawn");
+        std::thread::Builder::new().name("scry-bar-search".into()).spawn(move || worker(&work, &engine, &home, target)).expect("spawn");
+        Ok(got.cloned())
+    }
+}
 
+/// Run this thread's windows (the bar's, the tray's, the folders') until
+/// the process ends.
+pub fn pump() {
+    let edit = handles().map(|(_, edit, _)| edit);
+    unsafe {
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            if msg.message == WM_KEYDOWN && msg.hwnd == edit && key(msg.wParam as u16) {
+            if msg.message == WM_KEYDOWN && Some(msg.hwnd) == edit && key(msg.wParam as u16) {
+                continue;
+            }
+            // Tab, Enter and Esc in the folders window, as in a dialog.
+            if let Some(w) = crate::folders::window()
+                && IsDialogMessageW(w, &msg) != 0
+            {
                 continue;
             }
             TranslateMessage(&msg);
@@ -432,7 +447,7 @@ fn edit_text(edit: HWND) -> Vec<u16> {
 
 /// Bring the bar up on the screen with the mouse, a quarter of the way
 /// down, the last query selected (typing replaces it).
-fn show() {
+pub fn show() {
     let Some((hwnd, edit, _)) = handles() else { return };
     unsafe {
         let mut pt: POINT = zeroed();

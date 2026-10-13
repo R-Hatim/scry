@@ -1,5 +1,5 @@
 [package]
-name = "fsearch"
+name = "scry"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
@@ -31,7 +31,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
-    # The search bar (fsearchd).
+    # The search bar (scryd).
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",

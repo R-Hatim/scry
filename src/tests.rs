@@ -21,7 +21,7 @@ struct Tree {
 
 impl Tree {
     fn new(name: &str) -> Tree {
-        let root = std::env::temp_dir().join(format!("fsearch-test-{}-{name}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("scry-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         // %TEMP% may be spelled with 8.3 names; the index holds real ones.
@@ -223,7 +223,7 @@ fn config_reads_with_any_bom() {
 #[test]
 fn pipe_serves_this_user() {
     use std::io::{BufRead, BufReader, Write};
-    let name = format!(r"\\.\pipe\fsearch-test-{}", std::process::id());
+    let name = format!(r"\\.\pipe\scry-test-{}", std::process::id());
     let listening = crate::sys::pipe_listen(&name, true).unwrap();
     let server = std::thread::spawn(move || {
         let conn = crate::sys::pipe_accept(listening).unwrap();
@@ -315,4 +315,67 @@ fn query_reads_windows_paths() {
     assert_eq!(q.scope.as_deref(), Some(&b"/C:/Windows"[..]), "the real spelling of an existing folder");
     assert_eq!(paths::from_user("~", r"C:\Windows"), Some(b"/C:/Windows".to_vec()));
     assert!(Path::new(&paths::display(b"/C:/Windows")).is_dir());
+}
+
+#[test]
+fn a_folder_left_out_later_leaves_the_index() {
+    let t = Tree::new("forget");
+    t.write(r"private_stuff\secret_plan.txt", "1");
+    t.write(r"kept\open_plan.txt", "2");
+    let mut live = live_of(&t);
+    t.write(r"private_stuff\later_plan.txt", "3");
+    live.apply_dir(&t.at("private_stuff"), false);
+    assert_eq!(find(&live, "later_plan").len(), 1);
+
+    assert_eq!(live.forget(&t.at("private_stuff")), 2, "the base file and the one added since");
+    assert!(find(&live, "secret_plan").is_empty());
+    assert!(find(&live, "later_plan").is_empty());
+    assert_eq!(find(&live, "open_plan").len(), 1);
+    assert_eq!(find(&live, "'private_stuff"), [t.root.join("private_stuff").to_string_lossy()], "the folder itself stays, as a crawl leaves it");
+    assert_eq!(live.forget(&t.at("private_stuff")), 0, "nothing left to forget");
+}
+
+#[test]
+fn content_forgets_folders_no_longer_yours() {
+    let t = Tree::new("content-roots");
+    t.write(r"mine\notes.md", "quokka sighting");
+    t.write(r"theirs\notes.md", "quokka again");
+    let idx = Tree::new("content-roots-idx");
+    let live = live_of(&t);
+    let roots = [t.at("mine"), t.at("theirs")];
+    let mut c = Content::open(idx.root.join("content"));
+    let todo = c.diff(content::wants(&live, &roots, &[], &roots));
+    for b in todo.batches() {
+        let (dir, id) = (c.dir.clone(), c.alloc_id());
+        c.push(content::build_segment(&dir, id, &todo, b).unwrap());
+    }
+    let q = Query::parse("", r"C:\").unwrap();
+    let grep = Grep::new("quokka", GrepMode::Literal).unwrap();
+    assert_eq!(c.search(&grep, &q).files.len(), 2);
+    assert_eq!(c.forget_outside(&roots), 0);
+    assert_eq!(c.forget_outside(&roots[..1]), 1);
+    let left = c.search(&grep, &q).files;
+    assert_eq!(left.len(), 1);
+    assert_eq!(paths::display(&left[0].path), t.root.join(r"mine\notes.md").to_string_lossy());
+}
+
+#[test]
+fn saving_folders_keeps_the_other_settings() {
+    let t = Tree::new("save-folders");
+    let home = t.root.join("home");
+    let (home_s, cfg) = (home.to_string_lossy().to_string(), t.root.join("config.json"));
+    std::fs::write(&cfg, r#"{"hotkey": "Win+Shift+F", "roots": ["~"]}"#).unwrap();
+    let (work, backups) = (t.root.join("work"), t.root.join(r"work\backups"));
+    crate::server::save_folders(&t.root, &home_s, &[home.clone(), work.clone()], std::slice::from_ref(&backups)).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&cfg).unwrap()).unwrap();
+    assert_eq!(v["hotkey"], "Win+Shift+F");
+    assert_eq!(v["roots"], serde_json::json!(["~", work.to_string_lossy()]), "your user folder is kept as ~");
+    assert_eq!(v["skip"], serde_json::json!([backups.to_string_lossy()]));
+    assert_eq!(crate::server::folders(&t.root, &home_s), (vec![home.clone(), work], vec![backups]));
+
+    std::fs::write(&cfg, "{not json").unwrap();
+    assert!(crate::server::save_folders(&t.root, &home_s, &[], &[]).is_err());
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "{not json", "an unreadable config is left alone");
+    std::fs::remove_file(&cfg).unwrap();
+    assert_eq!(crate::server::folders(&t.root, &home_s), (vec![home], vec![]), "no folders: your user folder");
 }
