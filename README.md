@@ -42,6 +42,11 @@ the bar away. The whole query language works in it (`ext:pdf invoice`,
 the words inside your files instead (filters still apply: `ext:cs
 SendInvoiceMail`).
 
+**Ctrl+C** copies the selected file (paste it into Explorer, a mail, a
+chat), **Ctrl+Shift+C** its path. What you open or copy ranks higher the
+next times, more for what you use often and recently. **Up** in an empty
+box brings back your past searches, one by one.
+
 The bar lives in the daemon, `scryd.exe`: it is there whenever the
 daemon runs (at login with `install --login`, or from the first search).
 Another key: `"hotkey": "Win+Shift+F"` in `config.json`. Without one, the
