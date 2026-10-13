@@ -266,8 +266,8 @@ fn journal_names_changed_folders() {
     let drive = t.ip[1];
     match watch::journal_dirs(drive, since) {
         // FAT, exFAT, ReFS, or a journal younger than 5 seconds.
-        None => eprintln!("no change journal on {}: skipped", drive as char),
-        Some(dirs) => assert!(dirs.contains(&t.at("j")), "{} not among {} folders", paths::display(&t.at("j")), dirs.len()),
+        Err(why) => eprintln!("{}: {why}: skipped", drive as char),
+        Ok(dirs) => assert!(dirs.contains(&t.at("j")), "{} not among {} folders", paths::display(&t.at("j")), dirs.len()),
     }
 }
 
@@ -378,4 +378,35 @@ fn saving_folders_keeps_the_other_settings() {
     assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "{not json", "an unreadable config is left alone");
     std::fs::remove_file(&cfg).unwrap();
     assert_eq!(crate::server::folders(&t.root, &home_s), (vec![home], vec![]), "no folders: your user folder");
+}
+
+#[test]
+fn a_checkpoint_resumes_where_it_was() {
+    let t = Tree::new("checkpoint");
+    t.write(r"a\kept_doc.txt", "1");
+    t.write(r"a\gone_doc.txt", "2");
+    let idx = Tree::new("checkpoint-idx");
+    let path = idx.root.join("index.bin");
+    let roots = std::slice::from_ref(&t.ip);
+    Index::build(listings(&t.ip), 1, now_secs(), roots).save(&path).unwrap();
+    let mut live = Live::new(Index::load(&path).unwrap());
+    std::fs::remove_file(t.root.join(r"a\gone_doc.txt")).unwrap();
+    t.write(r"a\added_later.txt", "3");
+    live.apply_dir(&t.at("a"), false);
+    live.synced_at = 1234;
+    let cp = live.checkpoint();
+
+    let mut again = Live::new(Index::load(&path).unwrap());
+    assert!(find(&again, "added_later").is_empty());
+    assert!(!again.restore_checkpoint(&cp[..cp.len() - 3]), "a cut-off checkpoint is refused");
+    assert!(find(&again, "added_later").is_empty(), "and leaves the index as it was");
+    assert!(again.restore_checkpoint(&cp));
+    assert_eq!(find(&again, "added_later").len(), 1);
+    assert!(find(&again, "gone_doc").is_empty());
+    assert_eq!(find(&again, "kept_doc").len(), 1);
+    assert_eq!(again.synced_at, 1234);
+
+    t.write("another.txt", "4");
+    let mut other = Live::new(Index::build(listings(&t.ip), 2, now_secs(), roots));
+    assert!(!other.restore_checkpoint(&cp), "a checkpoint of another base is refused");
 }

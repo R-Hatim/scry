@@ -154,6 +154,64 @@ impl Live {
         self.drop_over_subtree(path);
     }
 
+    /// What changed since the base was saved, as bytes for
+    /// `restore_checkpoint`: which base entries are gone, the overlay, and
+    /// how far it is in sync. A bit per base entry plus the overlay, so it
+    /// can be written every few minutes where the base can't: a restart then
+    /// catches up on minutes of changes, which the change journal still
+    /// holds, rather than on everything since the last save.
+    pub fn checkpoint(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(64 + self.dead.len() * 8 + self.over.len() * 64);
+        b.extend_from_slice(CHECKPOINT);
+        for v in [self.base.n as u64, self.base.event_id, self.event_id, self.dead.len() as u64, self.dead_count as u64, self.over.len() as u64] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&self.base.synced_at.to_le_bytes());
+        b.extend_from_slice(&self.synced_at.to_le_bytes());
+        for w in &self.dead {
+            b.extend_from_slice(&w.to_le_bytes());
+        }
+        for (p, e) in &self.over {
+            b.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            b.extend_from_slice(p);
+            b.push(e.kind);
+            b.extend_from_slice(&e.size.to_le_bytes());
+            b.extend_from_slice(&e.mtime.to_le_bytes());
+            b.extend_from_slice(&e.mask.to_le_bytes());
+            b.push(e.prior as u8);
+        }
+        b
+    }
+
+    /// Take up where a checkpoint of this same base left off. False, and
+    /// nothing changed, if it was taken of another base or does not read.
+    pub fn restore_checkpoint(&mut self, b: &[u8]) -> bool {
+        self.read_checkpoint(b).is_some()
+    }
+
+    fn read_checkpoint(&mut self, b: &[u8]) -> Option<()> {
+        let mut r = Bytes(b.strip_prefix(CHECKPOINT)?);
+        let [n, base_event, event_id, words, dead_count, over] = [r.u64()?, r.u64()?, r.u64()?, r.u64()?, r.u64()?, r.u64()?];
+        let (base_synced, synced_at) = (r.u32()?, r.u32()?);
+        let ours = (self.base.n as u64, self.base.event_id, self.base.synced_at, self.dead.len() as u64);
+        if (n, base_event, base_synced, words) != ours {
+            return None;
+        }
+        let dead = (0..words).map(|_| r.u64()).collect::<Option<Vec<u64>>>()?;
+        let mut map = BTreeMap::new();
+        for _ in 0..over {
+            let len = r.u32()? as usize;
+            let path = r.take(len)?.to_vec();
+            let e = OEnt { kind: r.u8()?, size: r.u64()?, mtime: r.u32()?, mask: r.u64()?, prior: r.u8()? as i8 };
+            map.insert(path, e);
+        }
+        if !r.0.is_empty() {
+            return None;
+        }
+        (self.dead, self.dead_count, self.over, self.event_id, self.synced_at) = (dead, dead_count as usize, map, event_id, synced_at);
+        Some(())
+    }
+
     /// Drop what is indexed under `path` but keep the folder itself, as a
     /// crawl leaves a folder it must not open: for one that is skipped now
     /// (`Options::skip`) but was indexed before. How many entries went.
@@ -490,4 +548,30 @@ pub fn lstat(path: &[u8]) -> Option<OEnt> {
     }
     let s = crate::sys::stat(path)?;
     Some(OEnt::new(path, walk::kind_of(s.attrs, s.tag), s.size, s.mtime))
+}
+
+/// A checkpoint file's first bytes, with the format's version.
+const CHECKPOINT: &[u8; 8] = b"SCRYCKP1";
+
+/// Little-endian values off the front of a byte slice; None past its end.
+struct Bytes<'a>(&'a [u8]);
+
+impl<'a> Bytes<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let (head, rest) = self.0.split_at_checked(n)?;
+        self.0 = rest;
+        Some(head)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
 }

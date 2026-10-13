@@ -54,6 +54,8 @@ struct Counts {
 
 struct Tray {
     hwnd: HWND,
+    /// For a checkpoint before the process ends.
+    engine: Engine,
     /// The index dir (config.json, the log) and your user folder.
     dir: PathBuf,
     home: String,
@@ -112,7 +114,7 @@ pub fn create(engine: Engine, hotkey: Option<String>, dir: PathBuf) {
         LoadIconMetric(inst, 1 as _, LIM_LARGE, &mut large);
         let latest = Arc::new(Mutex::new(Counts::default()));
         let home = engine.home().to_string();
-        let tray = Tray { hwnd, dir, home, small, large, hotkey, counts: Counts::default(), latest: latest.clone(), started: Instant::now() };
+        let tray = Tray { hwnd, engine: engine.clone(), dir, home, small, large, hotkey, counts: Counts::default(), latest: latest.clone(), started: Instant::now() };
         TRAY.with_borrow_mut(|t| *t = Some(tray));
         WINDOW.store(hwnd as isize, Ordering::Relaxed);
         add();
@@ -305,6 +307,7 @@ fn command(id: usize) {
         }
         ID_QUIT => {
             scry::log("quit from the tray");
+            checkpoint();
             remove();
             std::process::exit(0);
         }
@@ -312,10 +315,20 @@ fn command(id: usize) {
     }
 }
 
+/// Save what changed since the last full save, so the next start (after a
+/// quit, a restart, signing out) resumes from here.
+fn checkpoint() {
+    if let Some(engine) = with(|t| t.engine.clone()) {
+        engine.checkpoint();
+    }
+}
+
 /// Hand over to a new daemon, which reads config.json afresh, and leave:
 /// it waits for this one to be gone. `rescan`: folders it should list whole.
 pub fn restart(rescan: &[PathBuf]) {
     let Some(dir) = with(|t| t.dir.clone()) else { return };
+    // The new daemon resumes from here.
+    checkpoint();
     let args: Vec<OsString> = std::iter::once("--restart".into()).chain(rescan.iter().flat_map(|d| ["--rescan".into(), d.into()])).collect();
     match std::env::current_exe().and_then(|exe| server::start_daemon(&dir, &exe, &args)) {
         Ok(()) => {
@@ -346,6 +359,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_COMMAND => {
             command(wp & 0xFFFF);
+            0
+        }
+        // Signing out or shutting down: Windows ends the process right after.
+        WM_QUERYENDSESSION => 1,
+        WM_ENDSESSION => {
+            if wp != 0 {
+                checkpoint();
+            }
             0
         }
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {

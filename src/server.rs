@@ -212,6 +212,7 @@ fn handle(conn: std::fs::File, engine: &Engine) {
         }
         if resp["quitting"] == true {
             log("asked to quit");
+            engine.checkpoint();
             if let Some(f) = ON_QUIT.get() {
                 f();
             }

@@ -204,15 +204,15 @@ const LISTED: u32 = USN_REASON_FILE_CREATE
 /// it (Windows 10 1709+): names come back blank, but each record keeps the
 /// id of the folder it happened in, which is all a relist needs. A folder
 /// that is gone by now resolves to nothing; its own removal is recorded in
-/// its parent. None when the journal doesn't reach back to `since`, or
+/// its parent. Err (why) when the journal doesn't reach back to `since`, or
 /// there is none (FAT, exFAT; ReFS's 128-bit ids).
-pub fn journal_dirs(drive: u8, since: u32) -> Option<Vec<Vec<u8>>> {
-    let h = sys::open_dir(&[b'/', drive, b':'], false)?;
+pub fn journal_dirs(drive: u8, since: u32) -> Result<Vec<Vec<u8>>, String> {
+    let h = sys::open_dir(&[b'/', drive, b':'], false).ok_or("the drive does not open")?;
     let mut jd: USN_JOURNAL_DATA_V0 = unsafe { zeroed() };
     let mut n = 0u32;
     let size = size_of::<USN_JOURNAL_DATA_V0>() as u32;
     if unsafe { DeviceIoControl(h.0, FSCTL_QUERY_USN_JOURNAL, std::ptr::null(), 0, (&raw mut jd).cast(), size, &mut n, std::ptr::null_mut()) } == 0 {
-        return None;
+        return Err(format!("no change journal ({})", std::io::Error::last_os_error()));
     }
     let cutoff = (since as i64 + 11_644_473_600) * 10_000_000;
     let mut rd = READ_USN_JOURNAL_DATA_V0 {
@@ -242,25 +242,26 @@ pub fn journal_dirs(drive: u8, since: u32) -> Option<Vec<Vec<u8>>> {
             )
         };
         if ok == 0 || n < 8 {
-            return None;
+            return Err(format!("the change journal does not read ({})", std::io::Error::last_os_error()));
         }
         let base = buf.as_ptr() as *const u8;
         let mut off = 8usize;
         while off < n as usize {
             // Records are 8-byte aligned and lie inside what the read filled.
             if off + size_of::<USN_RECORD_V2>() > n as usize {
-                return None;
+                return Err("a change journal record runs past the read".into());
             }
             let r = unsafe { base.add(off) } as *const USN_RECORD_V2;
             let (len, major, parent, time, reason) =
                 unsafe { ((*r).RecordLength, (*r).MajorVersion, (*r).ParentFileReferenceNumber, (*r).TimeStamp, (*r).Reason) };
             if major != 2 || len == 0 || off + len as usize > n as usize {
-                return None;
+                return Err(format!("a change journal record of version {major} is not understood"));
             }
             // The oldest record must predate `since`, or changes may be lost.
             covered |= time <= cutoff;
             if !covered {
-                return None;
+                let oldest = (time / 10_000_000 - 11_644_473_600).max(0);
+                return Err(format!("the change journal reaches back {} only, not the {} needed", ago(oldest), ago(since as i64)));
             }
             if time >= cutoff && reason & LISTED != 0 {
                 parents.insert(parent);
@@ -275,10 +276,21 @@ pub fn journal_dirs(drive: u8, since: u32) -> Option<Vec<Vec<u8>>> {
     }
     // An empty journal proves nothing either.
     if !covered {
-        return None;
+        return Err("the change journal is empty".into());
     }
     let ids: Vec<u64> = parents.into_iter().collect();
-    Some(ids.par_iter().filter_map(|&id| folder_by_id(&h, id)).collect())
+    Ok(ids.par_iter().filter_map(|&id| folder_by_id(&h, id)).collect())
+}
+
+/// How long ago Unix second `t` was, roughly: "3h 20m", "45m", "2d 4h".
+fn ago(t: i64) -> String {
+    let s = (crate::query::now_secs() as i64 - t).max(0);
+    let (d, h, m) = (s / 86_400, s % 86_400 / 3600, s % 3600 / 60);
+    match (d, h) {
+        (0, 0) => format!("{m}m"),
+        (0, _) => format!("{h}h {m}m"),
+        _ => format!("{d}d {h}h"),
+    }
 }
 
 /// The path of the folder with file id `id` on `vol`'s drive.

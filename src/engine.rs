@@ -30,6 +30,11 @@ const CONTENT_MAX_WAIT: Duration = Duration::from_secs(300);
 const FOLLOW_EVERY: Duration = Duration::from_secs(10);
 /// Seconds before the last known-good moment that a relist also covers.
 const SYNC_MARGIN: u32 = 120;
+/// How often what changed since the last full save is checkpointed
+/// (`Live::checkpoint`), so a restart resumes from minutes ago: the NTFS
+/// change journal may hold only a few hours of a busy disk.
+const CHECKPOINT_EVERY: Duration = Duration::from_secs(5 * 60);
+const CHECKPOINT: &str = "checkpoint.bin";
 
 pub struct Options {
     /// Where the index lives (`index.bin`, `content/`).
@@ -106,6 +111,8 @@ struct Shared {
     replaying: AtomicBool,
     /// Follower: content dir mtime when its segments were last opened.
     content_seen: Mutex<Option<std::time::SystemTime>>,
+    /// One checkpoint written at a time.
+    checkpointing: Mutex<()>,
 }
 
 /// One line to stderr (the daemon's log); a full disk must not take the
@@ -180,6 +187,7 @@ impl Engine {
             stream: Mutex::new(None),
             replaying: AtomicBool::new(true),
             content_seen: Mutex::new(None),
+            checkpointing: Mutex::new(()),
         });
         let base = Index::load(&shared.dir.join("index.bin"));
         let since = match &base {
@@ -209,7 +217,11 @@ impl Engine {
                     b
                 }
             };
-            *s.live.write().unwrap() = Some(Live::new(base));
+            let mut live = Live::new(base);
+            if owner {
+                resume(&s, &mut live);
+            }
+            *s.live.write().unwrap() = Some(live);
             if owner {
                 forget_skipped(&s);
                 start_content(&s);
@@ -288,6 +300,12 @@ impl Engine {
         }
     }
 
+    /// Save what changed since the last full save (a few MB at most), now:
+    /// before the process ends, so the next start resumes from here.
+    pub fn checkpoint(&self) {
+        self.s.checkpoint();
+    }
+
     /// Compact and save the name index soon (on the background thread).
     pub fn save(&self) {
         self.s.save_requested.store(true, Ordering::Relaxed);
@@ -326,6 +344,21 @@ const INDEXING: &str = "indexing (the first run lists every fixed drive, about a
 impl Shared {
     fn owner(&self) -> bool {
         self.owner.load(Ordering::Relaxed)
+    }
+
+    /// Write the checkpoint (`Live::checkpoint`) aside and rename it into
+    /// place. Only the owner: it is of the index the owner saved.
+    fn checkpoint(&self) {
+        if !self.owner() {
+            return;
+        }
+        let _one = self.checkpointing.lock().unwrap();
+        let Some(bytes) = self.live.read().unwrap().as_ref().map(Live::checkpoint) else { return };
+        let path = self.dir.join(CHECKPOINT);
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
+            log(format!("checkpoint failed: {e}"));
+        }
     }
 
     /// (Re)start watching the drives for an index current as of `since`,
@@ -515,7 +548,18 @@ fn compact(shared: &Shared) {
     let idx = Index::load(&path).unwrap_or(idx);
     let n = idx.n;
     *shared.live.write().unwrap() = Some(Live::new(idx));
+    // The saved index holds everything the checkpoint did.
+    let _ = std::fs::remove_file(shared.dir.join(CHECKPOINT));
     log(format!("compacted to {n} entries in {:.2?}", t.elapsed()));
+}
+
+/// The changes the last checkpoint holds, on top of the saved index: a
+/// restart then catches up from minutes ago.
+fn resume(s: &Shared, live: &mut Live) {
+    let Ok(b) = std::fs::read(s.dir.join(CHECKPOINT)) else { return };
+    if live.restore_checkpoint(&b) {
+        log(format!("resumed from the checkpoint: {} changes since the save, in sync as of {}", live.over.len() + live.dead_count, live.synced_at));
+    }
 }
 
 /// Changes went unseen (made while nothing watched, or more at once than
@@ -533,9 +577,15 @@ fn relist_changed(shared: &Shared, why: &str) {
     // synced_at 0 (unknown) checks every folder: a full crawl, done in place.
     let (mut dirs, mut unjournaled) = (Vec::new(), Vec::new());
     for d in sys::fixed_drives() {
-        match (synced != 0).then(|| watch::journal_dirs(d, from)).flatten() {
-            Some(v) => dirs.extend(v),
-            None => unjournaled.push(vec![b'/', d, b':']),
+        let journal = if synced == 0 { Err(String::new()) } else { watch::journal_dirs(d, from) };
+        match journal {
+            Ok(v) => dirs.extend(v),
+            Err(why) => {
+                if !why.is_empty() {
+                    log(format!("{}: {why}; checking its folders instead", d as char));
+                }
+                unjournaled.push(vec![b'/', d, b':']);
+            }
         }
     }
     let journaled = dirs.len();
@@ -587,6 +637,7 @@ fn check_drives(shared: &Shared) {
 
 fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<watch::Event>>) {
     let mut last_save = Instant::now();
+    let (mut last_checkpoint, mut checkpointed) = (Instant::now(), 0u32);
     let mut last_follow = Instant::now();
     let mut last_drives = Instant::now();
     let ours = paths::from_native(&shared.dir);
@@ -666,15 +717,18 @@ fn apply_loop(shared: &Arc<Shared>, rx: Receiver<Vec<watch::Event>>) {
         if !shared.owner() {
             continue;
         }
-        let (pending, stale) = {
+        let (pending, stale, synced) = {
             let g = shared.live.read().unwrap();
             let live = g.as_ref().unwrap();
-            (live.over.len() + live.dead_count, live.event_id != live.base.event_id)
+            (live.over.len() + live.dead_count, live.event_id != live.base.event_id, live.synced_at)
         };
         let asked = shared.save_requested.swap(false, Ordering::Relaxed);
         if asked || pending > COMPACT_PENDING || (stale && last_save.elapsed() > COMPACT_EVERY) {
             compact(shared);
-            last_save = Instant::now();
+            (last_save, last_checkpoint, checkpointed) = (Instant::now(), Instant::now(), synced);
+        } else if synced != checkpointed && last_checkpoint.elapsed() > CHECKPOINT_EVERY {
+            shared.checkpoint();
+            (last_checkpoint, checkpointed) = (Instant::now(), synced);
         }
     }
 }

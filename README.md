@@ -73,7 +73,7 @@ runs; the rest was measured through the daemon.
 | search inside files, cold disk cache | up to ~1.5 s (matches are read fresh from disk) |
 | a new, renamed or deleted file shows up | ~0.1 s |
 | first crawl of the disk | 50-80 s, once |
-| start after a reboot | searchable at once; changes made meanwhile are caught up in ~0.2 s when the index was saved recently, 15-30 s when the last save is hours old |
+| start after a reboot | searchable at once, caught up 0.05-0.5 s later |
 | daemon memory | ~22 MB, plus the index mapped from disk (190 MB of names, 71 MB of content for 36k text files; evictable) |
 
 ## Queries
@@ -156,6 +156,9 @@ others follow along.
   holds, the NTFS change journal (readable without admin) names the folders
   that changed since the index was last in sync. Drives without one are
   checked folder by folder.
+- A busy disk's change journal may hold only a few hours, so what changed
+  since the last full save of the index is checkpointed every five minutes
+  and at sign-out (a few MB): a restart needs only the last minutes.
 - Names live in one mmap'd file, laid out folder by folder so `in:` is a
   range. Each distinct name is scored once.
 - Content search uses a trigram index of your text files. Matches are read
