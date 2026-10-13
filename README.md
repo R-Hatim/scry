@@ -59,16 +59,22 @@ below), **Start at login** (the same login item as `install --login`) and
 
 ## Speed
 
-i7-11850H laptop, NVMe, Defender on, 5.0M files and folders on C:.
+i7-11850H laptop, NVMe, Defender on, 5.08M files and folders on C:, a
+busy development machine. Searches by name are `scry bench` medians over 20
+runs; the rest was measured through the daemon.
 
 | | |
 |---|---|
-| find a file by name, whole disk | median 0.07-0.6 ms (one word), ~5 ms (two) |
-| search inside files | 1-15 ms |
+| find a file by name, one word (`invoice`) | 0.5 ms; up to ~8 ms for a word with very many matches to rank |
+| with a typo (`mian.rs` finds `main.rs`) | 1.2 ms |
+| two words (`src main`) | 7-11 ms |
+| with a filter (`ext:pdf invoice`) | 0.07 ms |
+| search inside files, warm | 2-10 ms for words, ~60 ms for a regex |
+| search inside files, cold disk cache | up to ~1.5 s (matches are read fresh from disk) |
 | a new, renamed or deleted file shows up | ~0.1 s |
-| first crawl of the disk | ~80 s, once |
-| start after a reboot | at once, caught up ~0.2 s later |
-| daemon memory | ~12 MB, plus the index mapped from disk (~200 MB, evictable) |
+| first crawl of the disk | 50-80 s, once |
+| start after a reboot | searchable at once; changes made meanwhile are caught up in ~0.2 s when the index was saved recently, 15-30 s when the last save is hours old |
+| daemon memory | ~22 MB, plus the index mapped from disk (190 MB of names, 71 MB of content for 36k text files; evictable) |
 
 ## Queries
 
@@ -165,8 +171,8 @@ Releases are built from this repository by GitHub Actions
 ([release.yml](.github/workflows/release.yml)) from a version tag; nothing
 released is built on a personal machine.
 
-- Committers and reviewers: [Hatim Rih](https://github.com/R-Hatim)
-- Approvers: [Hatim Rih](https://github.com/R-Hatim)
+- Committers and reviewers: [@R-Hatim](https://github.com/R-Hatim)
+- Approvers: [@R-Hatim](https://github.com/R-Hatim)
 
 Changes from anyone else come in as pull requests, reviewed by a committer
 before they are merged. Every signing request is approved by hand.
