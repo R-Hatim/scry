@@ -115,11 +115,11 @@ fn version_info(version: &str, bin: &str, description: &str) -> Vec<u8> {
     }
     let exe = format!("{bin}.exe");
     let strings: Vec<Vec<u8>> = [
-        ("CompanyName", "Hatim Rih"),
+        ("CompanyName", "R-Hatim"),
         ("FileDescription", description),
         ("FileVersion", version),
         ("InternalName", bin),
-        ("LegalCopyright", "Copyright (c) 2026 Noah Dunnagan, Hatim Rih. MIT License."),
+        ("LegalCopyright", "Copyright (c) 2026 Noah Dunnagan, R-Hatim. MIT License."),
         ("OriginalFilename", &exe),
         ("ProductName", "Scry"),
         ("ProductVersion", version),
