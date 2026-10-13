@@ -10,7 +10,8 @@ which is macOS-only.
 
 ## Install
 
-Download `scry-<version>-setup-x64.exe` from the
+Download `scry-<version>-setup-x64.exe` (or `-setup-arm64.exe` on Windows
+on ARM) from the
 [latest release](https://github.com/R-Hatim/scry/releases/latest) and run
 it. It needs no administrator rights: it installs for you only
 (`%LOCALAPPDATA%\Programs\Scry`), starts Scry when you sign in and puts

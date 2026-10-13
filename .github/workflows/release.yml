@@ -1,6 +1,7 @@
-# A version tag (v0.1.0) builds the installer and a portable zip and
-# attaches them, with their checksums, to a draft release to review and
-# publish by hand. The tag must match the version in Cargo.toml.
+# A version tag (v0.1.0) builds Scry for x64 and ARM64, an installer and a
+# portable zip of each, and attaches them with their checksums to a draft
+# release to review and publish by hand. The tag must match the version in
+# Cargo.toml.
 name: Release
 
 on:
@@ -24,24 +25,32 @@ jobs:
           if ($v -ne $cargo) { throw "the tag says $v but Cargo.toml says $cargo" }
           "VERSION=$v" >> $env:GITHUB_ENV
 
+      - run: rustup target add aarch64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
       - run: cargo build --release --locked
+      # Windows on ARM, cross-compiled (its tests run on an ARM64 runner in CI).
+      - run: cargo build --release --locked --target aarch64-pc-windows-msvc
 
-      - name: Installer
+      - name: Installers
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
-          & $iscc /Q "/DAppVersion=$env:VERSION" installer\scry.iss
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          foreach ($arch in "x64", "arm64") {
+            & $iscc /Q "/DAppVersion=$env:VERSION" "/DArch=$arch" installer\scry.iss
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
 
-      - name: Portable zip and checksums
+      - name: Portable zips and checksums
         shell: pwsh
         run: |
           $dist = New-Item -ItemType Directory -Force target\dist
-          Copy-Item "target\installer\scry-$env:VERSION-setup-x64.exe" $dist
-          Compress-Archive -Path target\release\scry.exe, target\release\scryd.exe, README.md, LICENSE -DestinationPath "$dist\scry-$env:VERSION-x64.zip"
+          foreach ($arch in @(@("x64", "target\release"), @("arm64", "target\aarch64-pc-windows-msvc\release"))) {
+            $name, $bin = $arch
+            Copy-Item "target\installer\scry-$env:VERSION-setup-$name.exe" $dist
+            Compress-Archive -Path "$bin\scry.exe", "$bin\scryd.exe", README.md, LICENSE -DestinationPath "$dist\scry-$env:VERSION-$name.zip"
+          }
           $sums = Get-ChildItem $dist | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name }
           $sums | Set-Content "$dist\SHA256SUMS.txt"
 

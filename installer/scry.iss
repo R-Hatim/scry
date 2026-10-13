@@ -6,10 +6,24 @@
 ;
 ; After `cargo build --release`, from the repository root:
 ;   iscc /DAppVersion=0.1.0 installer\scry.iss
+; or, for Windows on ARM after `cargo build --release --target
+; aarch64-pc-windows-msvc`:
+;   iscc /DAppVersion=0.1.0 /DArch=arm64 installer\scry.iss
 ; The setup lands in target\installer.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
+#endif
+#ifndef Arch
+  #define Arch "x64"
+#endif
+#if Arch == "arm64"
+  #define Bin "..\target\aarch64-pc-windows-msvc\release"
+  #define Machines "arm64"
+#else
+  #define Bin "..\target\release"
+  ; Also Windows 11 on ARM, which runs x64 programs.
+  #define Machines "x64compatible"
 #endif
 #define Repo "https://github.com/R-Hatim/scry"
 
@@ -26,12 +40,12 @@ AppUpdatesURL={#Repo}/releases
 DefaultDirName={autopf}\Scry
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed={#Machines}
+ArchitecturesInstallIn64BitMode={#Machines}
 ; Windows 10 1809.
 MinVersion=10.0.17763
 OutputDir=..\target\installer
-OutputBaseFilename=scry-{#AppVersion}-setup-x64
+OutputBaseFilename=scry-{#AppVersion}-setup-{#Arch}
 SetupIconFile=..\assets\scry.ico
 UninstallDisplayIcon={app}\scryd.exe
 UninstallDisplayName=Scry
@@ -49,8 +63,8 @@ Name: "login"; Description: "Start Scry when I sign in"
 Name: "path"; Description: "Add the scry command to PATH (for terminals)"
 
 [Files]
-Source: "..\target\release\scry.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\scryd.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Bin}\scry.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Bin}\scryd.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 
