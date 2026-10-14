@@ -1,0 +1,8 @@
+# The C runtime linked into the programs: VCRUNTIME140.dll is not part of a
+# clean Windows install, and a program missing a DLL stops on a dialog (an
+# installer waiting on one never finishes).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
