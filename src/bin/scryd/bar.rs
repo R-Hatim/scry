@@ -8,6 +8,7 @@
 //! Searches run on a worker thread, which also looks up the icons (shell
 //! calls that may block), so typing never waits on either.
 
+use crate::chips::{self, CHIPS, Chip};
 use crate::usage::{History, Opened};
 use scry::{Engine, Found, Grep, GrepMode, Order, Query, human_age, human_size, paths, walk};
 use std::cell::RefCell;
@@ -109,14 +110,18 @@ struct Metrics {
     /// Room for the magnifier left of the query.
     glyph: i32,
     edit_h: i32,
+    /// The filter chips' row, under the query.
+    chip_y: i32,
+    chip_h: i32,
     top_h: i32,
     row_h: i32,
 }
 
 fn metrics(dpi: u32) -> Metrics {
     let px = |v: f32| (v * dpi as f32 / 96.0).round() as i32;
-    let (pad, edit_h) = (px(14.0), px(30.0));
-    Metrics { width: px(660.0), pad, glyph: px(30.0), edit_h, top_h: 2 * pad + edit_h, row_h: px(48.0) }
+    let (pad, edit_h, chip_h) = (px(14.0), px(30.0), px(26.0));
+    let chip_y = pad + edit_h + px(6.0);
+    Metrics { width: px(660.0), pad, glyph: px(30.0), edit_h, chip_y, chip_h, top_h: chip_y + chip_h + px(10.0), row_h: px(48.0) }
 }
 
 fn font(px: f32, dpi: u32, weight: i32, face: &str) -> HFONT {
@@ -167,6 +172,10 @@ struct Ui {
     history: History,
     recalled: Option<usize>,
     recalling: bool,
+    /// Where each filter chip was last drawn, for clicks.
+    chips: Vec<(Chip, RECT)>,
+    /// The folder picker is open: the focus going to it is not leaving.
+    picking: bool,
 }
 
 impl Ui {
@@ -324,6 +333,8 @@ pub fn create(engine: Engine, home: String, dir: &Path, hotkeys: &[String]) -> R
             history: History::load(dir),
             recalled: None,
             recalling: false,
+            chips: Vec::new(),
+            picking: false,
         };
         let theme = system_theme();
         ui.set_theme(theme);
@@ -391,6 +402,8 @@ fn key(vk: u16) -> bool {
         // The selected file rather than the query's text (when one is).
         VK_C if ctrl => return copy(unsafe { GetKeyState(VK_SHIFT as i32) } < 0),
         VK_ESCAPE => hide(),
+        // Right after `in:` or `path:`: pick the folder.
+        VK_TAB => fill_folder(),
         // The edit box would type a box character.
         VK_BACK if ctrl => delete_word(),
         _ => return false,
@@ -644,7 +657,9 @@ fn place() {
 
 /// The query changed: hand it to the worker.
 fn query_changed() {
-    let Some((_, edit, list)) = handles() else { return };
+    let Some((hwnd, edit, list)) = handles() else { return };
+    // The chips follow what is typed.
+    unsafe { InvalidateRect(hwnd, null(), 1) };
     // Typed into: no longer a past search brought back.
     with(|u| {
         if !u.recalling {
@@ -720,10 +735,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_ACTIVATE => {
-            if wp & 0xFFFF == WA_INACTIVE as usize {
+            // The folder picker takes the focus; the bar stays for it.
+            if wp & 0xFFFF == WA_INACTIVE as usize && !with(|u| u.picking).unwrap_or(false) {
                 hide();
             }
             0
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+            let hit = with(|u| u.chips.iter().find(|(_, r)| x >= r.left && x < r.right && y >= r.top && y < r.bottom).copied()).flatten();
+            if let Some((chip, r)) = hit {
+                chip_clicked(chip, r);
+            }
+            0
+        }
+        WM_SETCURSOR => {
+            let mut pt = POINT { x: 0, y: 0 };
+            unsafe {
+                GetCursorPos(&mut pt);
+                ScreenToClient(hwnd, &mut pt);
+            }
+            let over = with(|u| u.chips.iter().any(|(_, r)| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom)).unwrap_or(false);
+            if over && wp as HWND == hwnd {
+                unsafe { SetCursor(LoadCursorW(null_mut(), IDC_HAND)) };
+                return 1;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
         WM_DPICHANGED => {
             // We place ourselves; the suggested rect is for dragged windows.
@@ -746,7 +783,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_PAINT => {
             let mut ps: PAINTSTRUCT = unsafe { zeroed() };
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
-            with(|u| unsafe { paint(u, hdc) });
+            // The chips show the query's filters.
+            let text = handles().map_or_else(String::new, |(_, edit, _)| String::from_utf16_lossy(&edit_text(edit)));
+            with(|u| unsafe { paint(u, hdc, &text) });
             unsafe { EndPaint(hwnd, &ps) };
             0
         }
@@ -761,7 +800,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 /// The bar behind the controls: background, magnifier, the line under the
 /// query.
-unsafe fn paint(u: &Ui, hdc: HDC) {
+unsafe fn paint(u: &mut Ui, hdc: HDC, text: &str) {
     let m = metrics(u.dpi);
     let mut rc: RECT = unsafe { zeroed() };
     unsafe {
@@ -774,12 +813,143 @@ unsafe fn paint(u: &Ui, hdc: HDC) {
         let mut glyph = [0xE721u16];
         let mut g = RECT { left: m.pad, top: m.pad, right: m.pad + m.glyph, bottom: m.pad + m.edit_h };
         DrawTextW(hdc, glyph.as_mut_ptr(), 1, &mut g, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        paint_chips(u, hdc, &m, &rc, text);
         if !u.rows.is_empty() {
             let line = CreateSolidBrush(u.theme.line);
             let r = RECT { left: 0, top: m.top_h - 1, right: rc.right, bottom: m.top_h };
             FillRect(hdc, &r, line);
             DeleteObject(line);
         }
+    }
+}
+
+/// The filter chips under the query, read from the query as it is: one with
+/// a filter set shows it, filled.
+unsafe fn paint_chips(u: &mut Ui, hdc: HDC, m: &Metrics, rc: &RECT, text: &str) {
+    let px = |v: i32| v * u.dpi as i32 / 96;
+    let (inner, gap) = (px(10), px(6));
+    let mut x = m.pad + m.glyph;
+    u.chips.clear();
+    unsafe {
+        SelectObject(hdc, u.detail_font);
+        for chip in CHIPS {
+            let shown = chips::shown(text, chip);
+            let label = match (&shown, chip) {
+                (Some(v), _) => format!("{v} ▾"),
+                (None, Chip::Folder) => format!("{}…", chip.name()),
+                (None, _) => format!("{} ▾", chip.name()),
+            };
+            let mut w: Vec<u16> = label.encode_utf16().collect();
+            let mut size: SIZE = zeroed();
+            GetTextExtentPoint32W(hdc, w.as_ptr(), w.len() as i32, &mut size);
+            let r = RECT { left: x, top: m.chip_y, right: x + size.cx + 2 * inner, bottom: m.chip_y + m.chip_h };
+            if r.right > rc.right - m.pad {
+                break;
+            }
+            let on = shown.is_some();
+            let fill = CreateSolidBrush(if on { u.theme.sel } else { u.theme.bg });
+            let edge = CreatePen(PS_SOLID, 1, if on { u.theme.sel } else { u.theme.line });
+            let (old_fill, old_edge) = (SelectObject(hdc, fill), SelectObject(hdc, edge));
+            RoundRect(hdc, r.left, r.top, r.right, r.bottom, m.chip_h, m.chip_h);
+            SelectObject(hdc, old_fill);
+            SelectObject(hdc, old_edge);
+            DeleteObject(fill);
+            DeleteObject(edge);
+            SetTextColor(hdc, if on { u.theme.text } else { u.theme.dim });
+            let mut t = r;
+            DrawTextW(hdc, w.as_mut_ptr(), w.len() as i32, &mut t, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            u.chips.push((chip, r));
+            x = r.right + gap;
+        }
+    }
+}
+
+/// A chip was clicked: its menu under it (for the folder chip with no
+/// folder yet, the folder picker), and the choice written into the query.
+fn chip_clicked(chip: Chip, r: RECT) {
+    let Some((hwnd, edit, _)) = handles() else { return };
+    let text = String::from_utf16_lossy(&edit_text(edit));
+    let current = chips::shown(&text, chip);
+    let folder = |hwnd| pick(hwnd, "Search in this folder").map(|f| Some(format!("in:{}", chips::in_value(&f))));
+    // None: nothing chosen. Some(None): the filter goes.
+    let filter: Option<Option<String>> = if chip == Chip::Folder && current.is_none() {
+        folder(hwnd)
+    } else {
+        const OTHER: usize = 1;
+        const REMOVE: usize = 2;
+        const FIRST: usize = 100;
+        let cmd = unsafe {
+            let m = CreatePopupMenu();
+            if chip == Chip::Folder {
+                AppendMenuW(m, MF_STRING, OTHER, wide("Another folder…").as_ptr());
+            }
+            for (i, (label, _)) in chip.choices().iter().enumerate() {
+                let on = current.as_deref() == Some(*label);
+                AppendMenuW(m, MF_STRING | if on { MF_CHECKED } else { MF_UNCHECKED }, FIRST + i, wide(label).as_ptr());
+            }
+            if current.is_some() {
+                AppendMenuW(m, MF_SEPARATOR, 0, null());
+                AppendMenuW(m, MF_STRING, REMOVE, wide("Remove").as_ptr());
+            }
+            let mut pt = POINT { x: r.left, y: r.bottom };
+            ClientToScreen(hwnd, &mut pt);
+            let cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, hwnd, null()) as usize;
+            DestroyMenu(m);
+            cmd
+        };
+        match cmd {
+            0 => None,
+            OTHER => folder(hwnd),
+            REMOVE => Some(None),
+            i => chip.choices().get(i - FIRST).map(|(_, f)| Some(f.to_string())),
+        }
+    };
+    if let Some(filter) = filter {
+        set_query(edit, &chips::set(&text, chip, filter.as_deref()));
+    }
+}
+
+/// The query box set to `text`, the caret at its end: the search runs as if
+/// typed.
+fn set_query(edit: HWND, text: &str) {
+    let end = text.encode_utf16().count();
+    unsafe {
+        SetWindowTextW(edit, wide(text).as_ptr());
+        SendMessageW(edit, EM_SETSEL, end, end as LPARAM);
+        SetFocus(edit);
+    }
+}
+
+/// The folder picker, the bar staying up behind it (it would put itself
+/// away on losing the focus).
+fn pick(hwnd: HWND, title: &str) -> Option<PathBuf> {
+    with(|u| u.picking = true);
+    let folder = crate::folders::pick_folder(hwnd, title);
+    with(|u| u.picking = false);
+    unsafe { SetForegroundWindow(hwnd) };
+    if let Some((_, edit, _)) = handles() {
+        unsafe { SetFocus(edit) };
+    }
+    folder
+}
+
+/// Tab right after `in:` or `path:`: the folder picker fills in the value.
+/// Elsewhere Tab does nothing.
+fn fill_folder() {
+    let Some((hwnd, edit, _)) = handles() else { return };
+    let wtext = edit_text(edit);
+    let (mut start, mut end) = (0u32, 0u32);
+    unsafe { SendMessageW(edit, EM_GETSEL, (&raw mut start) as WPARAM, (&raw mut end) as LPARAM) };
+    let end = (end as usize).min(wtext.len());
+    let caret = String::from_utf16_lossy(&wtext[..end]).len();
+    let Some(key) = chips::folder_key_before(&String::from_utf16_lossy(&wtext), caret) else { return };
+    let title = if key == "in:" { "Search in this folder" } else { "Match the paths under this folder" };
+    let Some(folder) = pick(hwnd, title) else { return };
+    let value = if key == "in:" { chips::in_value(&folder) } else { chips::path_value(&folder) };
+    unsafe {
+        SendMessageW(edit, EM_SETSEL, end, end as LPARAM);
+        // Sends EN_CHANGE: the search runs as if typed.
+        SendMessageW(edit, EM_REPLACESEL, 1, wide(&value).as_ptr() as LPARAM);
     }
 }
 
