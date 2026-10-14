@@ -10,6 +10,7 @@
 #![windows_subsystem = "windows"]
 
 mod bar;
+mod chips;
 mod folders;
 mod tray;
 mod usage;

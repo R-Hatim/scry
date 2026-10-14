@@ -395,7 +395,7 @@ const FOS_PATHMUSTEXIST: u32 = 0x800;
 const SIGDN_FILESYSPATH: i32 = 0x8005_8000_u32 as i32;
 
 /// The system's folder picker (IFileOpenDialog); None if cancelled.
-fn pick_folder(owner: HWND, title: &str) -> Option<PathBuf> {
+pub fn pick_folder(owner: HWND, title: &str) -> Option<PathBuf> {
     // IFileDialog: Show 3, SetOptions 9, GetOptions 10, SetTitle 17,
     // GetResult 20. IShellItem: GetDisplayName 5.
     type Show = unsafe extern "system" fn(*mut c_void, HWND) -> HRESULT;
