@@ -1,10 +1,20 @@
 # Scry
 
+[![CI](https://github.com/R-Hatim/scry/actions/workflows/ci.yml/badge.svg)](https://github.com/R-Hatim/scry/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2FR-Hatim%2Fscry%2Fbadges%2Fcoverage.json)](https://github.com/R-Hatim/scry/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/R-Hatim/scry)](https://github.com/R-Hatim/scry/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/R-Hatim/scry/total)](https://github.com/R-Hatim/scry/releases)
+[![License: MIT](https://img.shields.io/github/license/R-Hatim/scry)](LICENSE)
+![Windows 10 and 11, x64 and ARM64](https://img.shields.io/badge/Windows%2010%20%7C%2011-x64%20%7C%20ARM64-0078D4)
+![Rust](https://img.shields.io/badge/Rust-stable-B7410E?logo=rust)
+
 Whole-disk file search for Windows: to scry is to see what is hidden. Finds
 any file on your fixed drives by name in about a millisecond, forgives
 typos, and searches inside your text files, Office documents and PDFs
 with an index. Use it from a search bar on a hotkey, as a CLI (with a
 small daemon), or as a Rust crate.
+
+![The search bar: "halcyon" typed, a project's folders, Word, Excel and image files listed as you type](docs/bar-search.png)
 
 A Windows port of [noahdunnagan/fsearch](https://github.com/noahdunnagan/fsearch),
 which is macOS-only.
@@ -50,6 +60,11 @@ and what you pick is written into the query, where you can still edit it.
 A chip shows the filter of its kind the query holds, typed or picked, and
 its menu can remove it. **In folder…** opens the folder picker, and so
 does **Tab** right after `in:` or `path:`.
+
+<p>
+<img src="docs/bar-chip-menu.png" width="49%" alt="The Type chip's menu open under the query: Documents, Images, Videos, Audio, Code, Archives, Apps, Fonts, Folders">
+<img src="docs/bar-chips.png" width="49%" alt="Documents, a folder and Newest first picked with the chips: the query reads halcyon type:doc sort:date in:C:\Projects, the newest documents first with their age">
+</p>
 
 **Ctrl+C** copies the selected file (paste it into Explorer, a mail, a
 chat), **Ctrl+Shift+C** its path. What you open or copy ranks higher the

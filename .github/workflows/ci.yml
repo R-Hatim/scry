@@ -1,4 +1,5 @@
-# Tests on every push to main and every pull request, on x64 and on ARM64.
+# Tests on every push to main and every pull request, on x64 and on ARM64;
+# the coverage badge from main.
 name: CI
 
 on:
@@ -16,6 +17,40 @@ jobs:
       # What the release does for Windows on ARM.
       - run: rustup target add aarch64-pc-windows-msvc
       - run: cargo build --release --locked --target aarch64-pc-windows-msvc
+
+  # The README's coverage badge: line coverage of the tests, published on the
+  # `badges` branch as a shields.io endpoint. Pushes to main only.
+  coverage:
+    if: github.event_name == 'push' && github.repository == 'R-Hatim/scry'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure
+        shell: pwsh
+        run: |
+          cargo llvm-cov --locked --all-targets --json --summary-only --output-path cov.json
+          $pct = (Get-Content cov.json -Raw | ConvertFrom-Json).data[0].totals.lines.percent
+          $color = if ($pct -ge 80) { 'brightgreen' } elseif ($pct -ge 60) { 'green' } elseif ($pct -ge 40) { 'yellow' } else { 'orange' }
+          New-Item -ItemType Directory badges | Out-Null
+          @{ schemaVersion = 1; label = 'coverage'; message = ('{0:0}%' -f $pct); color = $color } | ConvertTo-Json | Set-Content badges/coverage.json
+          "Line coverage: $('{0:0.0}' -f $pct)%" >> $env:GITHUB_STEP_SUMMARY
+      - name: Publish
+        shell: pwsh
+        working-directory: badges
+        run: |
+          git init -q -b badges
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add coverage.json
+          git commit -q -m "Coverage of $env:GITHUB_SHA"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" badges
 
   test-arm64:
     runs-on: windows-11-arm
