@@ -44,6 +44,13 @@ the bar away. The whole query language works in it (`ext:pdf invoice`,
 the words inside your files instead (filters still apply: `ext:cs
 SendInvoiceMail`).
 
+No need to learn the filters: the chips under the box (**Type**,
+**Modified**, **Size**, **In folder…**, **Sort**) each open a short menu,
+and what you pick is written into the query, where you can still edit it.
+A chip shows the filter of its kind the query holds, typed or picked, and
+its menu can remove it. **In folder…** opens the folder picker, and so
+does **Tab** right after `in:` or `path:`.
+
 **Ctrl+C** copies the selected file (paste it into Explorer, a mail, a
 chat), **Ctrl+Shift+C** its path. What you open or copy ranks higher the
 next times, more for what you use often and recently. **Up** in an empty
