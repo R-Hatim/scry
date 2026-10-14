@@ -1341,6 +1341,7 @@ pub fn human_age(t: u32) -> String {
         2_592_000..31_536_000 => (s / 2_592_000, "month"),
         _ => (s / 31_536_000, "year"),
     };
-    let plural = if n > 1 && unit.len() > 3 { "s" } else { "" };
+    // "min" and "h" are abbreviations: no plural.
+    let plural = if n > 1 && !matches!(unit, "min" | "h") { "s" } else { "" };
     format!("{n} {unit}{plural} ago")
 }

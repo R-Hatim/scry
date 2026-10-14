@@ -307,6 +307,16 @@ fn plain_words_leave_out_filters() {
 }
 
 #[test]
+fn ages_read_as_words() {
+    let ago = |s: u32| crate::query::human_age(now_secs() - s);
+    assert_eq!(ago(5 * 86_400 + 60), "5 days ago");
+    assert_eq!(ago(86_400 + 60), "1 day ago");
+    assert_eq!(ago(2 * 2_592_000 + 60), "2 months ago");
+    assert_eq!(ago(3 * 3600 + 60), "3 h ago", "abbreviations take no plural");
+    assert_eq!(ago(10 * 60 + 5), "10 min ago");
+}
+
+#[test]
 fn query_reads_windows_paths() {
     let q = Query::parse(r#"in:"C:\Windows\System32" drivers\etc"#, r"C:\Users\me").unwrap();
     assert_eq!(q.scope.as_deref(), Some(&b"/C:/Windows/System32"[..]));
