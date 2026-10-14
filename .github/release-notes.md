@@ -1,4 +1,4 @@
-Scry finds any file on your PC by name in about a millisecond, forgives typos, and searches inside your text files. Press **Alt+Shift+Space** anywhere for the search bar.
+Scry finds any file on your PC by name in about a millisecond, forgives typos, and searches inside your text files, Office documents and PDFs. Press **Alt+Shift+Space** anywhere for the search bar.
 
 ### Install
 
