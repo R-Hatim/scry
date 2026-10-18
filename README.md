@@ -19,6 +19,11 @@ small daemon), or as a Rust crate.
 A Windows port of [noahdunnagan/fsearch](https://github.com/noahdunnagan/fsearch),
 which is macOS-only.
 
+How Scry catches up after a restart, and the bug that made it recheck the
+whole disk instead, with interactive diagrams:
+[Three hours of memory, twelve hours of gap](https://hrih.si/articles/three-hours-of-memory/)
+on hrih.si.
+
 ## Install
 
 Download `scry-<version>-setup-x64.exe` (or `-setup-arm64.exe` on Windows
